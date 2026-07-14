@@ -375,6 +375,7 @@ const httpServer = createServer(async (req, res) => {
       agents.push({
         deviceId,
         agentId: device.agentId || '',
+        name: device.name || device.agentId || deviceId.substring(0, 12),
         patToken: maskToken(device.patToken),
         connectedAt: device.connectedAt,
         uptime: Date.now() - device.connectedAt,
@@ -382,6 +383,22 @@ const httpServer = createServer(async (req, res) => {
       });
     }
     return sendJSON(res, 200, { ok: true, agents, total: agents.length });
+  }
+
+  // ── 重命名 Device ──
+  if (path.match(/^\/api\/agents\/([^/]+)\/rename$/) && method === 'POST') {
+    const agentId = path.split('/')[3];
+    const { name } = body;
+    if (!name || !name.trim()) return sendJSON(res, 400, { ok: false, error: 'Name is required' });
+
+    let device = null;
+    for (const [id, dev] of devices) {
+      if (dev.agentId === agentId || id === agentId) { device = dev; break; }
+    }
+    if (!device) return sendJSON(res, 404, { ok: false, error: 'Device not found' });
+
+    device.name = name.trim();
+    return sendJSON(res, 200, { ok: true, name: device.name });
   }
 
   // ── 创建 Agent (通过 Bridge daemon spawn) ──
@@ -509,16 +526,50 @@ const httpServer = createServer(async (req, res) => {
     res.write(`data: ${JSON.stringify({ event: 'conversation.thinking', chat_id: messageId, text: randomThinking })}\n\n`);
 
     let fullResponse = '';
+    let hasDelta = false;
     try {
+      console.log(`[Prompt] Sending to device=${deviceId}, agentId=${agentId}, requestId=${messageId}`);
       await sendToDeviceStream(deviceId, acpRequest, (event) => {
+        console.log(`[Prompt] Stream event:`, JSON.stringify(event).substring(0, 200));
         if (event.method === 'session/update' && event.params?.delta) {
+          hasDelta = true;
           fullResponse += event.params.delta;
           res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.delta, chat_id: messageId })}\n\n`);
         } else if (event.method === 'session/update' && event.params?.text) {
+          hasDelta = true;
           fullResponse += event.params.text;
           res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.text, chat_id: messageId })}\n\n`);
         }
       });
+
+      // sendToDeviceStream resolve 时返回 Bridge 端的最终结果
+      // 如果流式事件没有触发（Bridge 端可能直接返回了结果），从最终结果中提取文本
+      const streamResult = await sendToDeviceStream(deviceId, acpRequest, (event) => {
+        console.log(`[Prompt] Stream event:`, JSON.stringify(event).substring(0, 200));
+        if (event.method === 'session/update' && event.params?.delta) {
+          hasDelta = true;
+          fullResponse += event.params.delta;
+          res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.delta, chat_id: messageId })}\n\n`);
+        } else if (event.method === 'session/update' && event.params?.text) {
+          hasDelta = true;
+          fullResponse += event.params.text;
+          res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.text, chat_id: messageId })}\n\n`);
+        }
+      });
+
+      // Fallback: 如果没有收到任何流式数据，但 Bridge 返回了完整结果，使用它
+      if (!hasDelta && !fullResponse && streamResult) {
+        const fallbackText = streamResult.text || streamResult.reply || streamResult.content || JSON.stringify(streamResult);
+        if (fallbackText && fallbackText !== '{}' && fallbackText !== '') {
+          console.log(`[Prompt] Using fallback text from result (no stream data):`, fallbackText.substring(0, 100));
+          fullResponse = fallbackText;
+          res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: fullResponse, chat_id: messageId })}\n\n`);
+        }
+      }
+
+      if (!hasDelta && !fullResponse) {
+        console.warn(`[Prompt] No response from device=${deviceId}, agentId=${agentId}. Result:`, JSON.stringify(streamResult)?.substring(0, 200));
+      }
 
       // 记录助手回复到会话
       if (conv && fullResponse) {
@@ -722,6 +773,8 @@ frontierWss.on('connection', (ws, req) => {
     const pending = findPending(msg);
 
     if (pending) {
+      console.log(`[Frontier] Matched pending request: id=${msg.id || msg.params?.requestId}, method=${msg.method || '(response)'}`);
+
       // 最终响应 (有 result 或 error)
       if (msg.result !== undefined) {
         const reqId = msg.id || msg.params?.requestId;
@@ -876,6 +929,11 @@ input,textarea{font-family:inherit;outline:none}
 .agent-item .name{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .agent-item .status{font-size:12px;color:var(--text3);margin-top:2px}
 .agent-item .status.online{color:var(--green)}
+.agent-main{display:flex;align-items:center;gap:12px;flex:1;min-width:0;cursor:pointer}
+.agent-actions{display:flex;gap:4px;flex-shrink:0;opacity:0;transition:opacity .15s}
+.agent-item:hover .agent-actions{opacity:1}
+.agent-act-btn{background:none;border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:14px;line-height:1;color:var(--text3);cursor:pointer}
+.agent-act-btn:hover{background:var(--surface);color:var(--text)}
 .sidebar-footer{padding:12px 16px;border-top:1px solid var(--border)}
 .sidebar-footer button{width:100%;padding:10px;border-radius:var(--radius-sm);font-size:13px;font-weight:500}
 
@@ -1170,14 +1228,18 @@ function renderAgentList() {
   }
 
   list.innerHTML = agents.map(a => {
-    const name = a.agentId || a.deviceId.substring(0, 12);
+    const name = a.name || a.agentId || a.deviceId.substring(0, 12);
     const active = currentAgent && (currentAgent.agentId === a.agentId || currentAgent.deviceId === a.deviceId);
     const uptime = Math.round((a.uptime || 0) / 1000);
     const avatar = name.substring(0, 2).toUpperCase();
-    return '<div class="agent-item' + (active ? ' active' : '') + '" onclick="selectAgent(\\'' + a.agentId + '\\',\\'' + a.deviceId + '\\')">' +
+    return '<div class="agent-item' + (active ? ' active' : '') + '" data-device-id="' + a.deviceId + '" data-agent-id="' + (a.agentId || '') + '">' +
+      '<div class="agent-main" onclick="selectAgent(\\'' + (a.agentId || '') + '\\',\\'' + a.deviceId + '\\')">' +
       '<div class="avatar">' + avatar + '</div>' +
-      '<div class="info"><div class="name">' + name + '</div>' +
-      '<div class="status online">● 在线 · ' + uptime + 's</div></div></div>';
+      '<div class="info"><div class="name">' + escapeHtml(name) + '</div>' +
+      '<div class="status online">● 在线 · ' + uptime + 's</div></div></div>' +
+      '<div class="agent-actions" onclick="event.stopPropagation()">' +
+      '<button class="agent-act-btn" onclick="showRenameModal(\\'' + (a.agentId || '') + '\\',\\'' + a.deviceId + '\\',\\'' + escapeHtml(name).replace(/'/g, "\\'") + '\\')" title="重命名">✏️</button>' +
+      '<button class="agent-act-btn" onclick="disconnectDevice(\\'' + (a.agentId || '') + '\\',\\'' + a.deviceId + '\\')" title="断开" style="color:var(--red)">✕</button></div></div>';
   }).join('');
 }
 
@@ -1467,6 +1529,49 @@ function toggleLogPanel() {
   }
 }
 
+// ── Device 管理 ──
+
+async function showRenameModal(agentId, deviceId, currentName) {
+  const name = prompt('输入新的设备名称:', currentName);
+  if (!name || !name.trim()) return;
+  try {
+    const resp = await api('/api/agents/' + encodeURIComponent(agentId || deviceId) + '/rename', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Rename failed');
+    await refreshAgents();
+    // 如果当前选中的设备被重命名，更新显示
+    if (currentAgent && (currentAgent.agentId === agentId || currentAgent.deviceId === deviceId)) {
+      document.getElementById('chatAgentName').textContent = name.trim();
+    }
+  } catch (e) {
+    alert('重命名失败: ' + e.message);
+  }
+}
+
+async function disconnectDevice(agentId, deviceId) {
+  if (!confirm('确定要断开此设备吗？')) return;
+  try {
+    const resp = await api('/api/agents/' + encodeURIComponent(agentId || deviceId), { method: 'DELETE' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Disconnect failed');
+    // 如果当前选中该设备，清空聊天区
+    if (currentAgent && (currentAgent.agentId === agentId || currentAgent.deviceId === deviceId)) {
+      currentAgent = null;
+      currentConversation = null;
+      document.getElementById('chatEmpty').style.display = 'flex';
+      document.getElementById('chatView').style.display = 'none';
+      document.getElementById('convPanel').classList.remove('open');
+      document.getElementById('logPanel').classList.remove('open');
+    }
+    await refreshAgents();
+  } catch (e) {
+    alert('断开失败: ' + e.message);
+  }
+}
+
 // ── Details ──
 function toggleDetails() {
   const panel = document.getElementById('detailsPanel');
@@ -1552,7 +1657,7 @@ async function generatePairCode() {
 
     document.getElementById('pairResult').style.display = 'block';
     const cmdBox = document.getElementById('pairCommand');
-    cmdBox.innerHTML = escapeHtml(data.command) + '<button class="copy" onclick="copyText(\\'' + data.command.replace(/'/g, "\\\\'") + '\\')">复制</button>';
+    cmdBox.innerHTML = escapeHtml(data.command) + '<button class="copy" onclick="copyText(\\'' + data.command.replace(/'/g, "\\\\'") + '\\', this)">复制</button>';
     document.getElementById('pairCodeDisplay').textContent = data.pair_code;
 
     // Poll for connection
@@ -1584,10 +1689,10 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function copyText(text) {
+function copyText(text, btn) {
   navigator.clipboard.writeText(text).then(() => {
-    event.target.textContent = '✓';
-    setTimeout(() => event.target.textContent = '复制', 1500);
+    if (btn) btn.textContent = '✓';
+    setTimeout(() => { if (btn) btn.textContent = '复制'; }, 1500);
   });
 }
 
