@@ -26,10 +26,13 @@
  *
  *   WebSocket:
  *     /frontier                     → Bridge daemon 长连接 (Frontier 协议)
- *     /ws                           → 旧版 Bridge 反向连接 (向后兼容)
+ *
+ * 授权:
+ *   DOZE_ACCESS_KEY 环境变量 — 访问密钥，所有 /api/* 端点需要 Bearer 认证
+ *   未设置时为开放模式（仅本地测试用）
  *
  * 部署:
- *   Railway / Render / Fly.io: 设置 PORT 环境变量
+ *   Railway / Render / Fly.io: 设置 PORT + DOZE_ACCESS_KEY 环境变量
  *   本机测试: node relay.js --port 4000
  */
 
@@ -40,7 +43,35 @@ import { randomBytes, randomUUID } from 'node:crypto';
 // ── 配置 ────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.find(a => a.startsWith('--port='))?.split('=')[1] || '4000');
 const HOST = process.env.HOST || '0.0.0.0';
-const AUTH_TOKEN = process.env.DOZE_RELAY_TOKEN || '';
+const ACCESS_KEY = process.env.DOZE_ACCESS_KEY || ''; // Web UI + API 访问密钥
+
+// ── 授权检查 ────────────────────────────────────────────────
+
+/**
+ * 检查请求是否携带有效的 Access Key
+ * 优先级: Authorization: Bearer xxx > query ?key=xxx
+ */
+function checkAccessKey(req, url) {
+  if (!ACCESS_KEY) return true; // 未设置密钥则开放
+  const authHeader = req.headers.authorization;
+  if (authHeader === 'Bearer ' + ACCESS_KEY) return true;
+  const queryKey = url.searchParams.get('key');
+  if (queryKey === ACCESS_KEY) return true;
+  return false;
+}
+
+/**
+ * 不需要 Access Key 的路径白名单
+ * - /health: 健康检查
+ * - /api/pair: Bridge daemon 握手 (使用 pat-token 认证)
+ * - /frontier: WebSocket 连接 (使用 token 认证)
+ * - 静态资源
+ */
+function isPublicPath(path) {
+  return path === '/health'
+    || path === '/api/pair'
+    || path === '/api/auth/verify';
+}
 
 // ── 存储 ────────────────────────────────────────────────────
 
@@ -53,11 +84,6 @@ const pairCodes = new Map();
  * 已配对的 Bridge daemon 连接: deviceId → { ws, patToken, agentId, connectedAt, pendingRequests }
  */
 const devices = new Map();
-
-/**
- * 旧版 room 连接 (向后兼容): roomKey → { ws, pendingRequests }
- */
-const rooms = new Map();
 
 // ── 辅助函数 ────────────────────────────────────────────────
 
@@ -144,7 +170,7 @@ const httpServer = createServer(async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Doze-Room');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -158,6 +184,13 @@ const httpServer = createServer(async (req, res) => {
   let body = {};
   try { body = bodyStr ? JSON.parse(bodyStr) : {}; } catch {}
 
+  // ── Access Key 授权检查 ──
+  if (path.startsWith('/api/') && !isPublicPath(path)) {
+    if (!checkAccessKey(req, url)) {
+      return sendJSON(res, 401, { ok: false, error: 'Unauthorized: invalid or missing access key' });
+    }
+  }
+
   // ── 健康检查 ──
   if (path === '/health') {
     return sendJSON(res, 200, {
@@ -165,22 +198,30 @@ const httpServer = createServer(async (req, res) => {
       relay: true,
       devices: devices.size,
       pairCodes: pairCodes.size,
-      rooms: rooms.size,
       timestamp: Date.now(),
     });
   }
 
-  // ── 管理页面 ──
-  if (path === '/' || path === '/relay') {
-    return sendHTML(res, 200, renderAdminPage(req.headers.host));
+  // ── 管理页面 (Web UI) ──
+  if (path === '/' || path === '/relay' || path === '/app') {
+    return sendHTML(res, 200, renderWebUI(req.headers.host));
+  }
+
+  // ── Access Key 验证 ──
+  if (path === '/api/auth/verify' && method === 'POST') {
+    const key = body.access_key || req.headers.authorization?.replace('Bearer ', '');
+    if (!ACCESS_KEY) {
+      return sendJSON(res, 200, { ok: true, open: true, message: 'Access key not configured (open mode)' });
+    }
+    if (key === ACCESS_KEY) {
+      return sendJSON(res, 200, { ok: true, open: false });
+    }
+    return sendJSON(res, 401, { ok: false, error: 'Invalid access key' });
   }
 
   // ── 配对码生成 (客户端平台调用) ──
   if (path === '/api/pair/init' && method === 'POST') {
-    // 可选认证
-    if (AUTH_TOKEN && req.headers.authorization !== 'Bearer ' + AUTH_TOKEN) {
-      return sendJSON(res, 401, { ok: false, error: 'Unauthorized' });
-    }
+    // Access Key 已在上方统一检查
 
     const pairCode = generatePairCode();
     const patToken = body.pat_token || generatePatToken();
@@ -463,54 +504,6 @@ const httpServer = createServer(async (req, res) => {
     }
   }
 
-  // ── 旧版兼容: 转发到 room ──
-  let roomKey = req.headers['x-doze-room'];
-  if (!roomKey) {
-    const match = path.match(/^\/r\/([^/]+)(\/.*)?$/);
-    if (match) {
-      roomKey = match[1];
-      const subPath = match[2] || '/';
-      // 转发到旧版 room
-      const room = rooms.get(roomKey);
-      if (!room || room.ws.readyState !== 1) {
-        return sendJSON(res, 502, {
-          code: 502,
-          msg: `DozeServer "${roomKey}" 未连接到 Relay`,
-          hint: '请确认 doze-server/bridge 已启动并连接到本 Relay',
-        });
-      }
-
-      const requestId = 'req_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
-      const isStream = subPath.includes('/chat/stream');
-
-      const relayMsg = {
-        type: 'request',
-        id: requestId,
-        method,
-        url: subPath,
-        headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => k !== 'host')),
-        body: bodyStr || null,
-      };
-
-      room.pendingRequests.set(requestId, { res, startTime: Date.now(), isStream });
-
-      const timeout = setTimeout(() => {
-        if (room.pendingRequests.has(requestId)) {
-          room.pendingRequests.delete(requestId);
-          if (!res.headersSent) {
-            sendJSON(res, 504, { code: 504, msg: 'Gateway Timeout' });
-          } else {
-            res.end();
-          }
-        }
-      }, isStream ? 120000 : 30000);
-
-      room.pendingRequests.get(requestId).timeout = timeout;
-      room.ws.send(JSON.stringify(relayMsg));
-      return;
-    }
-  }
-
   sendJSON(res, 404, { ok: false, error: 'Not found: ' + path });
 });
 
@@ -618,85 +611,6 @@ frontierWss.on('connection', (ws, req) => {
   });
 });
 
-// ── WebSocket 服务器: 旧版兼容 (/ws) ────────────────────────
-
-const legacyWss = new WebSocketServer({ server: httpServer, path: '/ws' });
-
-legacyWss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  const roomKey = url.searchParams.get('room') || 'default';
-  const token = url.searchParams.get('token');
-
-  if (AUTH_TOKEN && token !== AUTH_TOKEN) {
-    ws.close(4001, 'Unauthorized');
-    return;
-  }
-
-  rooms.set(roomKey, {
-    ws,
-    connectedAt: Date.now(),
-    pendingRequests: new Map(),
-  });
-
-  console.log(`[Legacy] DozeServer 连接: room="${roomKey}" (共 ${rooms.size} 个连接)`);
-
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.type === 'response') {
-      const pending = rooms.get(roomKey)?.pendingRequests.get(msg.id);
-      if (!pending) return;
-
-      if (!pending.res.headersSent) {
-        pending.res.writeHead(msg.status || 200, msg.headers || { 'Content-Type': 'application/json' });
-      }
-
-      if (msg.body) {
-        clearTimeout(pending.timeout);
-        rooms.get(roomKey).pendingRequests.delete(msg.id);
-        pending.res.write(msg.body);
-        pending.res.end();
-      }
-    } else if (msg.type === 'sse') {
-      const pending = rooms.get(roomKey)?.pendingRequests.get(msg.id);
-      if (!pending) return;
-
-      if (!pending.res.headersSent) {
-        pending.res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        });
-      }
-      pending.res.write(msg.data);
-      if (msg.end) {
-        clearTimeout(pending.timeout);
-        rooms.get(roomKey).pendingRequests.delete(msg.id);
-        pending.res.end();
-      }
-    }
-  });
-
-  ws.on('close', () => {
-    const room = rooms.get(roomKey);
-    if (room) {
-      for (const [, pending] of room.pendingRequests) {
-        clearTimeout(pending.timeout);
-        if (!pending.res.headersSent) {
-          sendJSON(pending.res, 502, { code: 502, msg: 'DozeServer 断开连接' });
-        } else {
-          pending.res.end();
-        }
-      }
-      rooms.delete(roomKey);
-    }
-    console.log(`[Legacy] DozeServer 断开: room="${roomKey}" (剩余 ${rooms.size} 个连接)`);
-  });
-
-  ws.send(JSON.stringify({ type: 'connected', room: roomKey, message: '已连接到 Relay' }));
-});
-
 // ── 辅助函数 ────────────────────────────────────────────────
 
 function sendJSON(res, status, data) {
@@ -710,64 +624,592 @@ function sendHTML(res, status, html) {
   res.end(html);
 }
 
-function renderAdminPage(host) {
-  const deviceList = Array.from(devices.entries()).map(([id, dev]) => ({
-    deviceId: id,
-    agentId: dev.agentId || '(未指定)',
-    uptime: dev.connectedAt ? Math.round((Date.now() - dev.connectedAt) / 1000) : 0,
-    pending: dev.pendingRequests?.size || 0,
-  }));
-
-  const roomList = Array.from(rooms.entries()).map(([key, r]) => ({
-    room: key,
-    uptime: r.connectedAt ? Math.round((Date.now() - r.connectedAt) / 1000) : 0,
-    pending: r.pendingRequests.size,
-  }));
-
-  const devicesHtml = deviceList.length > 0
-    ? deviceList.map(d => `<tr><td>${d.deviceId.substring(0, 16)}...</td><td>${d.agentId}</td><td>${d.uptime}s</td><td>${d.pending}</td></tr>`).join('')
-    : '<tr><td colspan="4" style="color:#999;text-align:center">暂无 Bridge daemon 连接</td></tr>';
-
-  const roomsHtml = roomList.length > 0
-    ? roomList.map(r => `<tr><td>${r.room}</td><td>${r.uptime}s</td><td>${r.pending}</td></tr>`).join('')
-    : '<tr><td colspan="3" style="color:#999;text-align:center">暂无旧版连接</td></tr>';
-
+function renderWebUI(host) {
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Doze Relay</title>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Doze Relay</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#333}
-h1{color:#6C5CE7} h2{color:#555;margin-top:28px}
-table{width:100%;border-collapse:collapse;margin:16px 0}
-th,td{padding:8px 12px;border:1px solid #ddd;text-align:left}
-th{background:#f5f5f5}
-.cmd{background:#1a1a2e;color:#0f0;padding:12px;border-radius:6px;font-family:monospace;font-size:13px;overflow-x:auto;white-space:pre}
-.note{background:#e8f5e9;padding:12px;border-radius:6px;margin:12px 0;border-left:4px solid #4caf50}
-</style></head><body>
-<h1>Doze Relay</h1>
-<p>中继服务器运行中: <code>http://${host}</code></p>
+:root{
+  --bg:#0f0f1a;--bg2:#1a1a2e;--bg3:#16213e;--surface:#1e1e36;--surface2:#252542;
+  --border:#2a2a4a;--text:#e0e0f0;--text2:#8888aa;--text3:#555577;
+  --primary:#6c5ce7;--primary2:#a29bfe;--accent:#00d2ff;--green:#00b894;
+  --red:#e74c3c;--orange:#fdcb6e;--radius:12px;--radius-sm:8px;
+  --shadow:0 4px 24px rgba(0,0,0,.3);--transition:.2s ease;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+button{cursor:pointer;border:none;outline:none;font-family:inherit;transition:var(--transition)}
+input,textarea{font-family:inherit;outline:none}
 
-<h2>配对流程 (新架构)</h2>
-<div class="note">
-  <b>1. 客户端平台生成配对命令:</b>
-  <div class="cmd">curl -X POST http://${host}/api/pair/init</div>
-  <p>返回 <code>command</code> 字段，显示给用户执行。</p>
+/* ── Login ── */
+#login{display:flex;align-items:center;justify-content:center;height:100vh;background:linear-gradient(135deg,#0f0f1a 0%,#1a1a2e 50%,#16213e 100%)}
+.login-box{background:var(--surface);padding:48px 40px;border-radius:20px;width:400px;box-shadow:var(--shadow);text-align:center}
+.login-box h1{font-size:28px;margin-bottom:8px;background:linear-gradient(135deg,var(--primary2),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.login-box p{color:var(--text2);font-size:14px;margin-bottom:32px}
+.login-box input{width:100%;padding:14px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:15px;margin-bottom:16px}
+.login-box input:focus{border-color:var(--primary)}
+.login-box button{width:100%;padding:14px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;border-radius:var(--radius-sm);font-size:16px;font-weight:600}
+.login-box button:hover{opacity:.9;transform:translateY(-1px)}
+.login-error{color:var(--red);font-size:13px;margin-top:12px;min-height:18px}
+.login-hint{color:var(--text3);font-size:12px;margin-top:20px}
 
-  <b>2. 用户在本地机器执行:</b>
-  <div class="cmd">npx -y doze-bridge --pat-token=sat_xxx --pair-code=xxxx --relay-url=http://${host}</div>
+/* ── App Layout ── */
+#app{display:none;height:100vh;flex-direction:column}
+.app-header{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:56px;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0}
+.app-header .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px}
+.app-header .logo .dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+.app-header .actions{display:flex;gap:8px}
+.app-header button{padding:8px 16px;border-radius:var(--radius-sm);font-size:13px;font-weight:500}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary2)}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--primary);color:var(--text)}
 
-  <b>3. Bridge daemon 自动:</b>
-  HTTP 握手 → WebSocket 连接 → Agent 探测 → OS 自启
+.app-body{display:flex;flex:1;overflow:hidden}
+
+/* ── Sidebar ── */
+.sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.sidebar-header h3{font-size:14px;color:var(--text2);text-transform:uppercase;letter-spacing:1px}
+.sidebar-header .count{background:var(--surface2);padding:2px 10px;border-radius:20px;font-size:12px;color:var(--text2)}
+.agent-list{flex:1;overflow-y:auto;padding:8px}
+.agent-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:var(--radius-sm);cursor:pointer;transition:var(--transition);margin-bottom:4px}
+.agent-item:hover{background:var(--surface)}
+.agent-item.active{background:var(--surface2);border-left:3px solid var(--primary)}
+.agent-item .avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--primary),var(--accent));display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#fff;flex-shrink:0}
+.agent-item .info{flex:1;min-width:0}
+.agent-item .name{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-item .status{font-size:12px;color:var(--text3);margin-top:2px}
+.agent-item .status.online{color:var(--green)}
+.sidebar-footer{padding:12px 16px;border-top:1px solid var(--border)}
+.sidebar-footer button{width:100%;padding:10px;border-radius:var(--radius-sm);font-size:13px;font-weight:500}
+
+/* ── Chat Area ── */
+.chat-area{flex:1;display:flex;flex-direction:column;min-width:0}
+.chat-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text3)}
+.chat-empty .icon{font-size:64px;margin-bottom:16px;opacity:.3}
+.chat-empty h2{font-size:18px;margin-bottom:8px;color:var(--text2)}
+.chat-empty p{font-size:14px}
+.chat-header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--bg2)}
+.chat-header .agent-name{font-size:15px;font-weight:600}
+.chat-header .agent-meta{font-size:12px;color:var(--text3)}
+.chat-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
+.msg{display:flex;gap:12px;max-width:80%}
+.msg.user{align-self:flex-end;flex-direction:row-reverse}
+.msg .avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;flex-shrink:0}
+.msg.user .avatar{background:var(--accent)}
+.msg.ai .avatar{background:linear-gradient(135deg,var(--primary),var(--primary2))}
+.msg .bubble{padding:12px 16px;border-radius:var(--radius);font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.msg.user .bubble{background:var(--primary);color:#fff;border-top-right-radius:4px}
+.msg.ai .bubble{background:var(--surface);border:1px solid var(--border);border-top-left-radius:4px}
+.msg.ai .bubble .cursor{display:inline-block;width:2px;height:16px;background:var(--accent);animation:blink 1s infinite;vertical-align:text-bottom}
+@keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}
+.chat-input{padding:16px 20px;border-top:1px solid var(--border);background:var(--bg2)}
+.chat-input form{display:flex;gap:12px;align-items:flex-end}
+.chat-input textarea{flex:1;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;resize:none;max-height:120px;line-height:1.5}
+.chat-input textarea:focus{border-color:var(--primary)}
+.chat-input button{padding:12px 20px;background:var(--primary);color:#fff;border-radius:var(--radius-sm);font-size:14px;font-weight:600;flex-shrink:0}
+.chat-input button:hover{background:var(--primary2)}
+.chat-input button:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── Details Panel ── */
+.details-panel{width:300px;background:var(--bg2);border-left:1px solid var(--border);display:none;flex-direction:column;flex-shrink:0}
+.details-panel.open{display:flex}
+.details-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.details-header h3{font-size:14px;color:var(--text2)}
+.details-header .close{background:none;color:var(--text3);font-size:20px;padding:0 4px}
+.details-body{flex:1;overflow-y:auto;padding:16px}
+.details-section{margin-bottom:24px}
+.details-section h4{font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.detail-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.detail-row .key{color:var(--text2)}
+.detail-row .val{color:var(--text);font-family:monospace;font-size:12px}
+.file-tree-item{padding:6px 8px;font-size:13px;color:var(--text2);cursor:pointer;border-radius:4px}
+.file-tree-item:hover{background:var(--surface)}
+.file-tree-item .icon{margin-right:6px}
+.skill-badge{display:inline-block;padding:4px 12px;background:var(--surface2);border-radius:20px;font-size:12px;color:var(--text2);margin:0 4px 4px 0}
+
+/* ── Modal ── */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border-radius:var(--radius);width:520px;max-width:90vw;box-shadow:var(--shadow);overflow:hidden}
+.modal-header{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-header h3{font-size:18px}
+.modal-header .close{background:none;color:var(--text3);font-size:22px}
+.modal-body{padding:24px}
+.modal-body .field{margin-bottom:16px}
+.modal-body label{display:block;font-size:13px;color:var(--text2);margin-bottom:6px}
+.modal-body input,.modal-body select,.modal-body textarea{width:100%;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px}
+.modal-body textarea{resize:vertical;min-height:80px}
+.cmd-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;font-family:'SF Mono',Consolas,monospace;font-size:13px;color:var(--green);overflow-x:auto;white-space:pre-wrap;word-break:break-all;position:relative}
+.cmd-box .copy{position:absolute;top:8px;right:8px;padding:4px 10px;background:var(--surface2);border-radius:4px;font-size:12px;color:var(--text2)}
+.cmd-box .copy:hover{color:var(--text)}
+.modal-footer{padding:16px 24px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
+.modal-footer button{padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:500}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+
+/* ── Responsive ── */
+@media(max-width:768px){
+  .sidebar{width:60px}
+  .sidebar-header h3,.sidebar-footer button span,.agent-item .info{display:none}
+  .details-panel{display:none!important}
+  .modal{width:95vw}
+}
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="login">
+  <div class="login-box">
+    <h1>Doze Relay</h1>
+    <p>输入访问密钥以继续</p>
+    <input type="password" id="accessKeyInput" placeholder="Access Key" autofocus>
+    <button id="loginBtn" onclick="doLogin()">登 录</button>
+    <div class="login-error" id="loginError"></div>
+    <div class="login-hint">提示: 密钥由管理员通过 DOZE_ACCESS_KEY 环境变量设置</div>
+  </div>
 </div>
 
-<h2>已连接的 Bridge Daemon (${deviceList.length})</h2>
-<table><tr><th>Device ID</th><th>Agent ID</th><th>在线时长</th><th>待处理</th></tr>
-${devicesHtml}</table>
+<!-- Main App -->
+<div id="app">
+  <div class="app-header">
+    <div class="logo"><span class="dot"></span> Doze Relay</div>
+    <div class="actions">
+      <button class="btn-ghost" onclick="openPairModal()">配对</button>
+      <button class="btn-ghost" onclick="logout()">退出</button>
+    </div>
+  </div>
+  <div class="app-body">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h3>Agents</h3>
+        <span class="count" id="agentCount">0</span>
+      </div>
+      <div class="agent-list" id="agentList"></div>
+      <div class="sidebar-footer">
+        <button class="btn-ghost" onclick="openPairModal()" style="border-style:dashed">+ 配对新设备</button>
+      </div>
+    </div>
+    <!-- Chat Area -->
+    <div class="chat-area">
+      <div id="chatEmpty" class="chat-empty">
+        <div class="icon">💬</div>
+        <h2>选择一个 Agent 开始对话</h2>
+        <p>或点击「配对」连接新设备</p>
+      </div>
+      <div id="chatView" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+        <div class="chat-header">
+          <div>
+            <div class="agent-name" id="chatAgentName"></div>
+            <div class="agent-meta" id="chatAgentMeta"></div>
+          </div>
+          <button class="btn-ghost" onclick="toggleDetails()">详情</button>
+        </div>
+        <div class="chat-messages" id="chatMessages"></div>
+        <div class="chat-input">
+          <form onsubmit="sendMessage(event)">
+            <textarea id="msgInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+            <button type="submit" id="sendBtn">发送</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    <!-- Details Panel -->
+    <div class="details-panel" id="detailsPanel">
+      <div class="details-header">
+        <h3>Agent 详情</h3>
+        <button class="close" onclick="toggleDetails()">&times;</button>
+      </div>
+      <div class="details-body" id="detailsBody"></div>
+    </div>
+  </div>
+</div>
 
-<h2>旧版连接 (${roomList.length})</h2>
-<table><tr><th>Room</th><th>在线时长</th><th>待处理</th></tr>
-${roomsHtml}</table>
+<!-- Pair Modal -->
+<div class="modal-overlay" id="pairModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>配对新设备</h3>
+      <button class="close" onclick="closePairModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="pairModalBody">
+      <div class="field">
+        <label>Agent ID (可选)</label>
+        <input type="text" id="pairAgentId" placeholder="留空自动生成">
+      </div>
+      <button class="btn-primary" onclick="generatePairCode()" style="width:100%;padding:12px;border-radius:8px;font-size:14px;font-weight:600">生成配对命令</button>
+      <div id="pairResult" style="display:none;margin-top:20px">
+        <div class="field">
+          <label>在本地机器执行以下命令</label>
+          <div class="cmd-box" id="pairCommand"></div>
+        </div>
+        <div class="field">
+          <label>配对码 (10 分钟有效)</label>
+          <div style="font-family:monospace;font-size:16px;color:var(--accent);padding:8px 0" id="pairCodeDisplay"></div>
+        </div>
+        <div style="color:var(--text3);font-size:13px">等待 Bridge daemon 连接...</div>
+        <div id="pairWaiting" style="text-align:center;padding:20px;color:var(--text2);font-size:14px"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closePairModal()">关闭</button>
+    </div>
+  </div>
+</div>
 
-<p style="color:#999;margin-top:20px">Doze Relay · ${new Date().toISOString()}</p>
+<script>
+let ACCESS_KEY = localStorage.getItem('doze_access_key') || '';
+let currentAgent = null;
+let agents = [];
+let pairPollTimer = null;
+
+// ── API Helper ──
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...opts.headers };
+  if (ACCESS_KEY) headers['Authorization'] = 'Bearer ' + ACCESS_KEY;
+  const resp = await fetch(path, { ...opts, headers });
+  if (resp.status === 401) { logout(); throw new Error('Unauthorized'); }
+  return resp;
+}
+
+// ── Login ──
+async function doLogin() {
+  const key = document.getElementById('accessKeyInput').value.trim();
+  if (!key) { document.getElementById('loginError').textContent = '请输入 Access Key'; return; }
+  try {
+    const resp = await fetch('/api/auth/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_key: key }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      ACCESS_KEY = key;
+      localStorage.setItem('doze_access_key', key);
+      showApp();
+    } else {
+      document.getElementById('loginError').textContent = data.error || '验证失败';
+    }
+  } catch (e) {
+    document.getElementById('loginError').textContent = '连接失败: ' + e.message;
+  }
+}
+
+function logout() {
+  ACCESS_KEY = '';
+  localStorage.removeItem('doze_access_key');
+  location.reload();
+}
+
+async function showApp() {
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  await refreshAgents();
+  // Auto-refresh
+  setInterval(refreshAgents, 5000);
+}
+
+// ── Agents ──
+async function refreshAgents() {
+  try {
+    const resp = await api('/api/agents');
+    const data = await resp.json();
+    agents = data.agents || [];
+    renderAgentList();
+  } catch (e) { console.error('refreshAgents:', e); }
+}
+
+function renderAgentList() {
+  const list = document.getElementById('agentList');
+  document.getElementById('agentCount').textContent = agents.length;
+
+  if (agents.length === 0) {
+    list.innerHTML = '<div style="text-align:center;padding:40px 20px;color:var(--text3);font-size:13px">暂无连接的 Agent<br><br>点击下方按钮配对新设备</div>';
+    return;
+  }
+
+  list.innerHTML = agents.map(a => {
+    const name = a.agentId || a.deviceId.substring(0, 12);
+    const active = currentAgent && (currentAgent.agentId === a.agentId || currentAgent.deviceId === a.deviceId);
+    const uptime = Math.round((a.uptime || 0) / 1000);
+    const avatar = name.substring(0, 2).toUpperCase();
+    return '<div class="agent-item' + (active ? ' active' : '') + '" onclick="selectAgent(\\'' + a.agentId + '\\',\\'' + a.deviceId + '\\')">' +
+      '<div class="avatar">' + avatar + '</div>' +
+      '<div class="info"><div class="name">' + name + '</div>' +
+      '<div class="status online">● 在线 · ' + uptime + 's</div></div></div>';
+  }).join('');
+}
+
+function selectAgent(agentId, deviceId) {
+  currentAgent = { agentId, deviceId };
+  const agent = agents.find(a => a.agentId === agentId || a.deviceId === deviceId);
+  const name = agentId || deviceId.substring(0, 12);
+  document.getElementById('chatEmpty').style.display = 'none';
+  document.getElementById('chatView').style.display = 'flex';
+  document.getElementById('chatAgentName').textContent = name;
+  document.getElementById('chatAgentMeta').textContent = agent ? 'Device: ' + agent.deviceId.substring(0, 16) + '... · ' + (agent.pending || 0) + ' pending' : '';
+  document.getElementById('chatMessages').innerHTML = '';
+  renderAgentList();
+}
+
+// ── Chat ──
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.querySelector('.chat-input form').requestSubmit();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+async function sendMessage(e) {
+  e.preventDefault();
+  const input = document.getElementById('msgInput');
+  const msg = input.value.trim();
+  if (!msg || !currentAgent) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+
+  const agentId = currentAgent.agentId || currentAgent.deviceId;
+  const messagesDiv = document.getElementById('chatMessages');
+
+  // User message
+  messagesDiv.innerHTML += '<div class="msg user"><div class="avatar">U</div><div class="bubble">' + escapeHtml(msg) + '</div></div>';
+  // AI placeholder
+  messagesDiv.innerHTML += '<div class="msg ai" id="aiPlaceholder"><div class="avatar">AI</div><div class="bubble"><span class="cursor"></span></div></div>';
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+  document.getElementById('sendBtn').disabled = true;
+
+  try {
+    const resp = await api('/api/agents/' + encodeURIComponent(agentId) + '/prompt', {
+      method: 'POST',
+      body: JSON.stringify({ messages: [{ role: 'user', content: msg }] }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error('HTTP ' + resp.status + ': ' + errText);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let aiText = '';
+    const placeholder = document.getElementById('aiPlaceholder');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.event === 'conversation.message.delta' && event.delta) {
+              aiText += event.delta;
+              placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) + '<span class="cursor"></span>';
+              messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            } else if (event.event === 'conversation.chat.completed') {
+              placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText);
+              placeholder.removeAttribute('id');
+            } else if (event.event === 'error') {
+              placeholder.querySelector('.bubble').innerHTML = '<span style="color:var(--red)">Error: ' + escapeHtml(event.error) + '</span>';
+              placeholder.removeAttribute('id');
+            }
+          } catch (e) {}
+        }
+      }
+    }
+    // Final cleanup
+    if (placeholder) {
+      placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) || '(empty response)';
+      placeholder.removeAttribute('id');
+    }
+  } catch (err) {
+    const placeholder = document.getElementById('aiPlaceholder');
+    if (placeholder) placeholder.querySelector('.bubble').innerHTML = '<span style="color:var(--red)">Failed: ' + escapeHtml(err.message) + '</span>';
+  } finally {
+    document.getElementById('sendBtn').disabled = false;
+    document.getElementById('msgInput').focus();
+  }
+}
+
+// ── Details ──
+function toggleDetails() {
+  const panel = document.getElementById('detailsPanel');
+  if (panel.classList.contains('open')) {
+    panel.classList.remove('open');
+  } else {
+    panel.classList.add('open');
+    loadDetails();
+  }
+}
+
+async function loadDetails() {
+  if (!currentAgent) return;
+  const body = document.getElementById('detailsBody');
+  const agentId = currentAgent.agentId || currentAgent.deviceId;
+  const agent = agents.find(a => a.agentId === currentAgent.agentId || a.deviceId === currentAgent.deviceId);
+  let html = '<div class="details-section"><h4>基本信息</h4>';
+  html += '<div class="detail-row"><span class="key">Agent ID</span><span class="val">' + escapeHtml(agentId) + '</span></div>';
+  if (agent) {
+    html += '<div class="detail-row"><span class="key">Device</span><span class="val">' + escapeHtml(agent.deviceId.substring(0, 20)) + '...</span></div>';
+    html += '<div class="detail-row"><span class="key">在线时长</span><span class="val">' + Math.round((agent.uptime||0)/1000) + 's</span></div>';
+    html += '<div class="detail-row"><span class="key">待处理</span><span class="val">' + (agent.pending||0) + '</span></div>';
+    html += '<div class="detail-row"><span class="key">连接时间</span><span class="val">' + new Date(agent.connectedAt).toLocaleString() + '</span></div>';
+  }
+  html += '</div>';
+
+  // Files
+  body.innerHTML = html + '<div class="details-section"><h4>文件树</h4><div style="color:var(--text3);font-size:13px">加载中...</div></div>';
+  try {
+    const resp = await api('/api/agents/' + encodeURIComponent(agentId) + '/files');
+    const data = await resp.json();
+    let filesHtml = '';
+    if (data.files && data.files.length) {
+      filesHtml = data.files.map(f => '<div class="file-tree-item"><span class="icon">' + (f.type === 'dir' ? '📁' : '📄') + '</span>' + escapeHtml(f.name) + '</div>').join('');
+    } else if (data.tree) {
+      filesHtml = '<pre style="font-size:12px;color:var(--text2);white-space:pre-wrap">' + escapeHtml(JSON.stringify(data.tree, null, 2)) + '</pre>';
+    } else {
+      filesHtml = '<div style="color:var(--text3);font-size:13px">无文件或不支持</div>';
+    }
+    body.querySelector('.details-section:last-child').innerHTML = '<h4>文件树</h4>' + filesHtml;
+  } catch (e) {
+    body.querySelector('.details-section:last-child').innerHTML = '<h4>文件树</h4><div style="color:var(--text3);font-size:13px">加载失败</div>';
+  }
+
+  // Skills
+  html = '<div class="details-section"><h4>技能</h4><div style="color:var(--text3);font-size:13px">加载中...</div></div>';
+  body.innerHTML += html;
+  try {
+    const resp = await api('/api/agents/' + encodeURIComponent(agentId) + '/skills');
+    const data = await resp.json();
+    let skillsHtml = '';
+    if (data.skills && data.skills.length) {
+      skillsHtml = data.skills.map(s => '<span class="skill-badge">' + escapeHtml(typeof s === 'string' ? s : (s.name || JSON.stringify(s))) + '</span>').join('');
+    } else {
+      skillsHtml = '<div style="color:var(--text3);font-size:13px">无技能</div>';
+    }
+    body.lastElementChild.innerHTML = '<h4>技能</h4>' + skillsHtml;
+  } catch (e) {
+    if (body.lastElementChild) body.lastElementChild.innerHTML = '<h4>技能</h4><div style="color:var(--text3);font-size:13px">加载失败</div>';
+  }
+}
+
+// ── Pair Modal ──
+function openPairModal() {
+  document.getElementById('pairModal').classList.add('open');
+  document.getElementById('pairResult').style.display = 'none';
+  document.getElementById('pairAgentId').value = '';
+}
+function closePairModal() {
+  document.getElementById('pairModal').classList.remove('open');
+  if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+}
+
+async function generatePairCode() {
+  const agentId = document.getElementById('pairAgentId').value.trim();
+  try {
+    const resp = await api('/api/pair/init', {
+      method: 'POST',
+      body: JSON.stringify(agentId ? { agent_id: agentId } : {}),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+
+    document.getElementById('pairResult').style.display = 'block';
+    const cmdBox = document.getElementById('pairCommand');
+    cmdBox.innerHTML = escapeHtml(data.command) + '<button class="copy" onclick="copyText(\\'' + data.command.replace(/'/g, "\\\\'") + '\\')">复制</button>';
+    document.getElementById('pairCodeDisplay').textContent = data.pair_code;
+
+    // Poll for connection
+    let dots = 0;
+    const waitEl = document.getElementById('pairWaiting');
+    pairPollTimer = setInterval(async () => {
+      dots = (dots + 1) % 4;
+      waitEl.textContent = '等待连接' + '.'.repeat(dots);
+      try {
+        const r = await api('/api/agents');
+        const d = await r.json();
+        if (d.agents && d.agents.length > 0) {
+          clearInterval(pairPollTimer);
+          pairPollTimer = null;
+          waitEl.innerHTML = '<span style="color:var(--green);font-size:18px">✓ Agent 已连接!</span>';
+          await refreshAgents();
+          setTimeout(closePairModal, 2000);
+        }
+      } catch (e) {}
+    }, 1000);
+  } catch (e) {
+    alert('生成失败: ' + e.message);
+  }
+}
+
+// ── Utils ──
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => {
+    event.target.textContent = '✓';
+    setTimeout(() => event.target.textContent = '复制', 1500);
+  });
+}
+
+// ── Init ──
+document.getElementById('accessKeyInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+// Auto-login if saved key
+(async function init() {
+  if (ACCESS_KEY) {
+    try {
+      const resp = await fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ access_key: ACCESS_KEY }),
+      });
+      const data = await resp.json();
+      if (data.ok) { showApp(); return; }
+    } catch (e) {}
+    localStorage.removeItem('doze_access_key');
+    ACCESS_KEY = '';
+  }
+  // Check if open mode
+  try {
+    const resp = await fetch('/api/auth/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await resp.json();
+    if (data.ok && data.open) {
+      ACCESS_KEY = '';
+      showApp();
+    }
+  } catch (e) {}
+})();
+</script>
 </body></html>`;
 }
 
@@ -781,7 +1223,12 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`  健康检查:   http://${HOST}:${PORT}/health`);
   console.log(`  配对初始化: POST http://${HOST}:${PORT}/api/pair/init`);
   console.log(`  Frontier WS: ws://${HOST}:${PORT}/frontier`);
-  console.log(`  Legacy WS:  ws://${HOST}:${PORT}/ws`);
+  console.log('');
+  if (ACCESS_KEY) {
+    console.log(`  Access Key: 已启用 (Web UI 需登录)`);
+  } else {
+    console.log(`  Access Key: 未设置 (开放模式)`);
+  }
   console.log('');
   console.log('  等待 Bridge daemon 连接...');
 });

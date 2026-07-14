@@ -19,6 +19,9 @@ ENV HOST=0.0.0.0
 # PORT 由平台自动注入 (Railway/Render/Fly.io)
 # 本地运行时默认 4000
 ENV PORT=4000
+# DOZE_ACCESS_KEY: 访问密钥，保护 Web UI 和所有 API 端点
+# 部署时通过 -e DOZE_ACCESS_KEY=your-key 或平台环境变量设置
+# 未设置时为开放模式（仅本地测试用）
 
 # 暴露端口
 EXPOSE 4000

@@ -33,7 +33,7 @@ primary_region = "nrt"           # 东京区域（离中国最近）
 # 环境变量
 [env]
   PORT = "4000"
-  # DOZE_RELAY_TOKEN = "your-secret-token"
+  # DOZE_ACCESS_KEY = "your-access-key-123"
 
 # VM 配置（最小规格）
 [[vm]]

@@ -19,9 +19,9 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      # 可选：设置认证 Token
-      # - key: DOZE_RELAY_TOKEN
-      #   value: your-secret-token
+      # 可选：设置访问密钥
+      # - key: DOZE_ACCESS_KEY
+      #   value: your-access-key-123
       # PORT 由 Render 自动注入，无需手动设置
     # 免费套餐会在 15 分钟无请求后休眠
     # 首次请求会自动唤醒（可能有几秒延迟）

@@ -41,14 +41,14 @@ Cloud relay server — simulates Coze cloud with pairing handshake + Frontier We
 | Path | Description |
 |------|-------------|
 | `/frontier` | Bridge daemon long connection (Frontier protocol) |
-| `/ws` | Legacy bridge connection (backward compatible) |
 
 ### Utility
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `GET` | `/` | Admin panel |
+| `GET` | `/` | Web UI (login + chat + management) |
+| `POST` | `/api/auth/verify` | Verify access key |
 
 ## Deploy
 
@@ -111,7 +111,7 @@ docker run -d -p 4000:4000 --restart unless-stopped doze-relay
 |----------|---------|-------------|
 | `PORT` | `4000` | Listen port (auto-injected by Railway/Render) |
 | `HOST` | `0.0.0.0` | Listen address |
-| `DOZE_RELAY_TOKEN` | (none) | Optional auth token for `/api/pair/init` |
+| `DOZE_ACCESS_KEY` | (none) | **Access key** — protects Web UI + all `/api/*` endpoints. Required for production. |
 
 ## Usage Flow
 
@@ -120,10 +120,11 @@ After deployment, you get a public URL like `https://doze-relay.up.railway.app`.
 ### Step 1: Generate pair command
 
 ```bash
-curl -X POST https://doze-relay.up.railway.app/api/pair/init
+curl -X POST https://doze-relay.up.railway.app/api/pair/init \
+  -H "Authorization: Bearer YOUR_ACCESS_KEY"
 ```
 
-Response:
+Or open the Web UI at `https://doze-relay.up.railway.app/` and log in with your access key.
 ```json
 {
   "ok": true,
@@ -145,10 +146,14 @@ npx -y doze-bridge --pat-token=sat_xxx --pair-code=a1b2-c3d4e5 --relay-url=https
 
 ```bash
 # List agents
-curl https://doze-relay.up.railway.app/api/agents
+curl -H "Authorization: Bearer YOUR_ACCESS_KEY" \
+  https://doze-relay.up.railway.app/api/agents
 
 # Send a prompt (SSE streaming)
 curl -N -X POST https://doze-relay.up.railway.app/api/agents/agent_xxx/prompt \
+  -H "Authorization: Bearer YOUR_ACCESS_KEY" \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+Or use the Web UI chat interface at `https://doze-relay.up.railway.app/`

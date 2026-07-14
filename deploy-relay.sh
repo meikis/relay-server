@@ -83,17 +83,22 @@ deploy_railway() {
   echo "     点击 Generate Domain 获取公网地址"
   echo "     如: https://doze-relay-production.up.railway.app"
   echo ""
-  echo "  2. 生成配对命令:"
-  echo "     curl -X POST https://doze-relay-production.up.railway.app/api/pair/init"
+  echo "  2. 设置环境变量:"
+  echo "     在 Railway Dashboard → Variables 中添加:"
+  echo "     DOZE_ACCESS_KEY=your-access-key-123"
   echo ""
-  echo "  3. 在本地机器执行配对命令:"
+  echo "  3. 生成配对命令:"
+  echo "     方法 A: 在 Web UI 中点击「配对」按钮"
+  echo "     方法 B: curl -X POST https://doze-relay-production.up.railway.app/api/pair/init \\"
+  echo "       -H 'Authorization: Bearer YOUR_ACCESS_KEY'"
+  echo ""
+  echo "  4. 在本地机器执行配对命令:"
   echo "     npx -y doze-bridge --pat-token=sat_xxx --pair-code=xxxx \\"
   echo "       --relay-url=https://doze-relay-production.up.railway.app"
   echo ""
-  echo "  4. 客户端调用 Agent:"
-  echo "     curl -N -X POST https://doze-relay-production.up.railway.app/api/agents/agent_xxx/prompt \\"
-  echo "       -H 'Content-Type: application/json' \\"
-  echo "       -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'"
+  echo "  5. 使用 Web UI 聊天:"
+  echo "     浏览器打开 https://doze-relay-production.up.railway.app/"
+  echo "     输入 Access Key 登录即可聊天"
   echo "  ════════════════════════════════════════════"
 }
 
@@ -193,12 +198,15 @@ deploy_docker() {
 
   # 运行
   inf "启动容器..."
-  docker run -d --name doze-relay -p 4000:4000 --restart unless-stopped doze-relay
+  docker run -d --name doze-relay -p 4000:4000 --restart unless-stopped \
+    -e DOZE_ACCESS_KEY=your-access-key-123 \
+    doze-relay
 
   ok "Relay 已启动: http://localhost:4000"
   echo ""
+  echo "  浏览器打开 http://localhost:4000 输入 Access Key 即可使用"
   echo "  生成配对命令:"
-  echo "  curl -X POST http://localhost:4000/api/pair/init"
+  echo "  curl -X POST http://localhost:4000/api/pair/init -H 'Authorization: Bearer your-access-key-123'"
   echo ""
   echo "  查看日志:   docker logs doze-relay"
   echo "  停止:       docker stop doze-relay"
@@ -232,7 +240,7 @@ deploy_local() {
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════════╗"
 echo "║  Doze Relay v2 部署工具                   ║"
-echo "║  模拟 Coze 云握手 + Frontier WebSocket    ║"
+echo "║  Web UI + Access Key 授权 + Frontier WS   ║"
 echo "╚══════════════════════════════════════════╝"
 echo -e "${RESET}"
 
