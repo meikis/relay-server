@@ -85,6 +85,17 @@ const pairCodes = new Map();
  */
 const devices = new Map();
 
+/**
+ * 会话管理: conversationId → { id, agentId, deviceId, createdAt, messages[] }
+ * 每个会话对应远端 OpenMinis/OpenClaw 的一个对话上下文
+ */
+const conversations = new Map();
+
+/**
+ * 请求日志: requestId → { conversationId, agentId, method, params, status, response, timestamp }
+ */
+const requestLog = new Map();
+
 // ── 辅助函数 ────────────────────────────────────────────────
 
 function generatePairCode() {
@@ -291,6 +302,72 @@ const httpServer = createServer(async (req, res) => {
     });
   }
 
+  // ── 会话管理 ──
+  if (path === '/api/conversations' && method === 'GET') {
+    const agentId = url.searchParams.get('agent_id');
+    const list = [];
+    for (const [id, conv] of conversations) {
+      if (agentId && conv.agentId !== agentId && conv.deviceId !== agentId) continue;
+      list.push({
+        id: conv.id,
+        agentId: conv.agentId,
+        deviceId: conv.deviceId,
+        messageCount: conv.messages?.length || 0,
+        createdAt: conv.createdAt,
+      });
+    }
+    list.sort((a, b) => b.createdAt - a.createdAt);
+    return sendJSON(res, 200, { ok: true, conversations: list });
+  }
+
+  if (path.match(/^\/api\/conversations$/) && method === 'POST') {
+    const { agent_id } = body;
+    let deviceId = null;
+    for (const [id, dev] of devices) {
+      if (dev.agentId === agent_id || id === agent_id) { deviceId = id; break; }
+    }
+    if (!deviceId) return sendJSON(res, 404, { ok: false, error: `Agent ${agent_id} not connected` });
+
+    const convId = 'conv_' + Date.now().toString(36);
+    conversations.set(convId, {
+      id: convId,
+      agentId: agent_id,
+      deviceId,
+      createdAt: Date.now(),
+      messages: [],
+    });
+    return sendJSON(res, 200, { ok: true, conversation_id: convId });
+  }
+
+  // ── 请求日志 ──
+  if (path === '/api/requests' && method === 'GET') {
+    const convId = url.searchParams.get('conversation_id');
+    const list = [];
+    for (const [id, log] of requestLog) {
+      if (convId && log.conversationId !== convId) continue;
+      list.push({
+        id,
+        conversationId: log.conversationId,
+        agentId: log.agentId,
+        method: log.method,
+        params: log.params,
+        status: log.status,
+        response: log.response ? log.response.substring(0, 200) : null,
+        timestamp: log.timestamp,
+      });
+    }
+    list.sort((a, b) => b.timestamp - a.timestamp);
+    return sendJSON(res, 200, { ok: true, requests: list });
+  }
+
+  // ── 会话详情 ──
+  if (path.match(/^\/api\/conversations\/([^/]+)$/) && method === 'GET') {
+    const convId = path.split('/')[3];
+    const conv = conversations.get(convId);
+    if (!conv) return sendJSON(res, 404, { ok: false, error: 'Conversation not found' });
+    return sendJSON(res, 200, { ok: true, conversation: conv });
+  }
+
   // ── 列出已连接的设备/Agent ──
   if (path === '/api/agents' && method === 'GET') {
     const agents = [];
@@ -342,6 +419,7 @@ const httpServer = createServer(async (req, res) => {
   // ── Agent 对话 (SSE 流式) ──
   if (path.match(/^\/api\/agents\/([^/]+)\/prompt$/) && method === 'POST') {
     const agentId = path.split('/')[3];
+    const conversationId = body.conversation_id || null;
 
     // 找到对应的 device
     let deviceId = null;
@@ -361,6 +439,34 @@ const httpServer = createServer(async (req, res) => {
       return sendJSON(res, 502, { ok: false, error: `Agent ${agentId} disconnected` });
     }
 
+    // 如果指定了 conversation_id，确保会话存在；否则自动创建
+    let convId = conversationId;
+    if (!convId) {
+      convId = 'conv_' + Date.now().toString(36);
+      conversations.set(convId, {
+        id: convId,
+        agentId,
+        deviceId,
+        createdAt: Date.now(),
+        messages: [],
+      });
+    } else if (!conversations.has(convId)) {
+      conversations.set(convId, {
+        id: convId,
+        agentId,
+        deviceId,
+        createdAt: Date.now(),
+        messages: [],
+      });
+    }
+    // 记录用户消息到会话
+    const conv = conversations.get(convId);
+    if (conv && body.messages?.length > 0) {
+      body.messages.forEach(m => {
+        conv.messages.push({ role: m.role, content: m.content, timestamp: Date.now() });
+      });
+    }
+
     // 构造 ACP session/prompt 请求
     const acpRequest = {
       method: 'session/prompt',
@@ -368,9 +474,22 @@ const httpServer = createServer(async (req, res) => {
         agentId,
         messages: body.messages || [],
         stream: true,
-        ...body.conversation_id ? { conversationId: body.conversation_id } : {},
+        ...(convId ? { conversationId: convId } : {}),
       },
     };
+
+    // 记录请求日志
+    const reqLogId = 'req_' + Date.now().toString(36);
+    requestLog.set(reqLogId, {
+      id: reqLogId,
+      conversationId: convId,
+      agentId,
+      method: 'session/prompt',
+      params: { messageCount: body.messages?.length || 0 },
+      status: 'pending',
+      response: null,
+      timestamp: Date.now(),
+    });
 
     // SSE 响应
     res.writeHead(200, {
@@ -381,21 +500,37 @@ const httpServer = createServer(async (req, res) => {
 
     const messageId = 'msg_' + Date.now().toString(36);
 
-    // 发送初始事件
-    res.write(`data: ${JSON.stringify({ event: 'conversation.chat.created', chat_id: messageId, status: 'in_progress' })}\n\n`);
+    // 发送初始事件（包含会话 ID）
+    res.write(`data: ${JSON.stringify({ event: 'conversation.chat.created', chat_id: messageId, conversation_id: convId, status: 'in_progress' })}\n\n`);
 
+    let fullResponse = '';
     try {
       await sendToDeviceStream(deviceId, acpRequest, (event) => {
         if (event.method === 'session/update' && event.params?.delta) {
+          fullResponse += event.params.delta;
           res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.delta, chat_id: messageId })}\n\n`);
         } else if (event.method === 'session/update' && event.params?.text) {
+          fullResponse += event.params.text;
           res.write(`data: ${JSON.stringify({ event: 'conversation.message.delta', delta: event.params.text, chat_id: messageId })}\n\n`);
         }
       });
 
+      // 记录助手回复到会话
+      if (conv && fullResponse) {
+        conv.messages.push({ role: 'assistant', content: fullResponse, timestamp: Date.now() });
+      }
+
+      // 更新请求日志
+      const log = requestLog.get(reqLogId);
+      if (log) { log.status = 'completed'; log.response = fullResponse; }
+
       res.write(`data: ${JSON.stringify({ event: 'conversation.message.completed', chat_id: messageId })}\n\n`);
-      res.write(`data: ${JSON.stringify({ event: 'conversation.chat.completed', chat_id: messageId, status: 'completed' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ event: 'conversation.chat.completed', chat_id: messageId, conversation_id: convId, status: 'completed' })}\n\n`);
     } catch (err) {
+      // 更新请求日志为失败
+      const log = requestLog.get(reqLogId);
+      if (log) { log.status = 'error'; log.response = err.message; }
+
       res.write(`data: ${JSON.stringify({ event: 'error', error: err.message, chat_id: messageId })}\n\n`);
     }
 
@@ -676,6 +811,35 @@ input,textarea{font-family:inherit;outline:none}
 
 .app-body{display:flex;flex:1;overflow:hidden}
 
+/* ── Conversation Panel ── */
+.conv-panel{width:240px;background:var(--bg2);border-right:1px solid var(--border);display:none;flex-direction:column;flex-shrink:0}
+.conv-panel.open{display:flex}
+.conv-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0}
+.conv-header h3{font-size:13px;color:var(--text2)}
+.conv-header .actions{display:flex;gap:4px}
+.conv-list{flex:1;overflow-y:auto;padding:8px}
+.conv-item{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:var(--radius-sm);cursor:pointer;margin-bottom:2px;font-size:13px;transition:var(--transition)}
+.conv-item:hover{background:var(--surface)}
+.conv-item.active{background:var(--surface2);border-left:3px solid var(--primary)}
+.conv-item .conv-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.conv-item .conv-time{font-size:11px;color:var(--text3);flex-shrink:0}
+.conv-empty{text-align:center;padding:40px 16px;color:var(--text3);font-size:13px}
+
+/* ── Request Log Panel ── */
+.log-panel{width:320px;background:var(--bg2);border-left:1px solid var(--border);display:none;flex-direction:column;flex-shrink:0}
+.log-panel.open{display:flex}
+.log-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.log-header h3{font-size:13px;color:var(--text2)}
+.log-body{flex:1;overflow-y:auto;padding:12px}
+.log-entry{background:var(--surface);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px;font-size:12px;border:1px solid var(--border)}
+.log-entry .log-method{color:var(--accent);font-family:monospace;font-size:11px;margin-bottom:4px}
+.log-entry .log-status{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600}
+.log-status.completed{background:rgba(34,197,94,.15);color:#22c55e}
+.log-status.error{background:rgba(239,68,68,.15);color:#ef4444}
+.log-status.pending{background:rgba(234,179,8,.15);color:#eab308}
+.log-entry .log-response{margin-top:6px;color:var(--text2);white-space:pre-wrap;word-break:break-word;max-height:80px;overflow-y:auto;font-size:11px}
+.log-entry .log-time{color:var(--text3);font-size:11px;margin-top:4px}
+
 /* ── Sidebar ── */
 .sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
 .sidebar-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
@@ -795,7 +959,7 @@ input,textarea{font-family:inherit;outline:none}
     </div>
   </div>
   <div class="app-body">
-    <!-- Sidebar -->
+    <!-- Sidebar: Agents -->
     <div class="sidebar">
       <div class="sidebar-header">
         <h3>Agents</h3>
@@ -804,6 +968,19 @@ input,textarea{font-family:inherit;outline:none}
       <div class="agent-list" id="agentList"></div>
       <div class="sidebar-footer">
         <button class="btn-ghost" onclick="openPairModal()" style="border-style:dashed">+ 配对新设备</button>
+      </div>
+    </div>
+    <!-- Conversation Panel -->
+    <div class="conv-panel" id="convPanel">
+      <div class="conv-header">
+        <h3>会话列表</h3>
+        <div class="actions">
+          <button class="btn-ghost" onclick="createConversation()" title="新建会话" style="padding:4px 8px;font-size:18px;line-height:1">+</button>
+          <button class="btn-ghost" onclick="toggleConvPanel()" title="关闭" style="padding:4px 8px;font-size:16px">×</button>
+        </div>
+      </div>
+      <div class="conv-list" id="convList">
+        <div class="conv-empty">选择 Agent 后显示会话</div>
       </div>
     </div>
     <!-- Chat Area -->
@@ -819,7 +996,11 @@ input,textarea{font-family:inherit;outline:none}
             <div class="agent-name" id="chatAgentName"></div>
             <div class="agent-meta" id="chatAgentMeta"></div>
           </div>
-          <button class="btn-ghost" onclick="toggleDetails()">详情</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn-ghost" onclick="toggleConvPanel()" id="convToggleBtn">会话</button>
+            <button class="btn-ghost" onclick="toggleLogPanel()" id="logToggleBtn">日志</button>
+            <button class="btn-ghost" onclick="toggleDetails()">详情</button>
+          </div>
         </div>
         <div class="chat-messages" id="chatMessages"></div>
         <div class="chat-input">
@@ -828,6 +1009,16 @@ input,textarea{font-family:inherit;outline:none}
             <button type="submit" id="sendBtn">发送</button>
           </form>
         </div>
+      </div>
+    </div>
+    <!-- Request Log Panel -->
+    <div class="log-panel" id="logPanel">
+      <div class="log-header">
+        <h3>请求日志</h3>
+        <button class="btn-ghost" onclick="toggleLogPanel()" style="padding:4px 8px;font-size:16px">×</button>
+      </div>
+      <div class="log-body" id="logBody">
+        <div style="text-align:center;padding:40px;color:var(--text3);font-size:13px">发送消息后显示日志</div>
       </div>
     </div>
     <!-- Details Panel -->
@@ -876,7 +1067,9 @@ input,textarea{font-family:inherit;outline:none}
 <script>
 let ACCESS_KEY = localStorage.getItem('doze_access_key') || '';
 let currentAgent = null;
+let currentConversation = null;  // 当前选中的会话 ID
 let agents = [];
+let conversations = [];          // 当前 Agent 的会话列表
 let pairPollTimer = null;
 
 // ── API Helper ──
@@ -958,14 +1151,17 @@ function renderAgentList() {
 
 function selectAgent(agentId, deviceId) {
   currentAgent = { agentId, deviceId };
+  currentConversation = null;  // 切换 Agent 时重置会话
   const agent = agents.find(a => a.agentId === agentId || a.deviceId === deviceId);
   const name = agentId || deviceId.substring(0, 12);
   document.getElementById('chatEmpty').style.display = 'none';
   document.getElementById('chatView').style.display = 'flex';
   document.getElementById('chatAgentName').textContent = name;
   document.getElementById('chatAgentMeta').textContent = agent ? 'Device: ' + agent.deviceId.substring(0, 16) + '... · ' + (agent.pending || 0) + ' pending' : '';
-  document.getElementById('chatMessages').innerHTML = '';
+  document.getElementById('chatMessages').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);font-size:13px">选择或新建一个会话开始对话</div>';
   renderAgentList();
+  // 加载该 Agent 的会话列表
+  loadConversations();
 }
 
 // ── Chat ──
@@ -1002,9 +1198,15 @@ async function sendMessage(e) {
   document.getElementById('sendBtn').disabled = true;
 
   try {
+    // 构造请求体，包含当前会话 ID（如果有）
+    const bodyData = { messages: [{ role: 'user', content: msg }] };
+    if (currentConversation) {
+      bodyData.conversation_id = currentConversation;
+    }
+
     const resp = await api('/api/agents/' + encodeURIComponent(agentId) + '/prompt', {
       method: 'POST',
-      body: JSON.stringify({ messages: [{ role: 'user', content: msg }] }),
+      body: JSON.stringify(bodyData),
     });
 
     if (!resp.ok) {
@@ -1016,6 +1218,7 @@ async function sendMessage(e) {
     const decoder = new TextDecoder();
     let buffer = '';
     let aiText = '';
+    let receivedConvId = null;  // 服务端返回的会话 ID
     const placeholder = document.getElementById('aiPlaceholder');
 
     while (true) {
@@ -1028,6 +1231,14 @@ async function sendMessage(e) {
         if (line.startsWith('data: ')) {
           try {
             const event = JSON.parse(line.slice(6));
+            if (event.event === 'conversation.chat.created' && event.conversation_id) {
+              receivedConvId = event.conversation_id;
+              // 如果是新建的会话，更新本地状态
+              if (!currentConversation) {
+                currentConversation = receivedConvId;
+                loadConversations();  // 刷新会话列表
+              }
+            }
             if (event.event === 'conversation.message.delta' && event.delta) {
               aiText += event.delta;
               placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) + '<span class="cursor"></span>';
@@ -1048,12 +1259,143 @@ async function sendMessage(e) {
       placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) || '(empty response)';
       placeholder.removeAttribute('id');
     }
+
+    // 刷新请求日志
+    loadRequestLog();
   } catch (err) {
     const placeholder = document.getElementById('aiPlaceholder');
     if (placeholder) placeholder.querySelector('.bubble').innerHTML = '<span style="color:var(--red)">Failed: ' + escapeHtml(err.message) + '</span>';
   } finally {
     document.getElementById('sendBtn').disabled = false;
     document.getElementById('msgInput').focus();
+  }
+}
+
+// ── Conversations (会话管理) ──
+async function loadConversations() {
+  if (!currentAgent) return;
+  const agentId = currentAgent.agentId || currentAgent.deviceId;
+  try {
+    const resp = await api('/api/conversations?agent_id=' + encodeURIComponent(agentId));
+    const data = await resp.json();
+    conversations = data.conversations || [];
+    renderConvList();
+  } catch (e) { console.error('loadConversations:', e); }
+}
+
+function renderConvList() {
+  const list = document.getElementById('convList');
+  if (conversations.length === 0) {
+    list.innerHTML = '<div class="conv-empty">暂无会话<br><br>点击 + 新建</div>';
+    return;
+  }
+
+  list.innerHTML = conversations.map(c => {
+    const active = currentConversation === c.id;
+    const time = new Date(c.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const title = c.id.replace('conv_', '会话 ') + ' (' + c.messageCount + '条)';
+    return '<div class="conv-item' + (active ? ' active' : '') + '" onclick="selectConversation(\\'' + c.id + '\\')">' +
+      '<div class="conv-title">' + escapeHtml(title) + '</div>' +
+      '<div class="conv-time">' + time + '</div></div>';
+  }).join('');
+}
+
+function selectConversation(convId) {
+  currentConversation = convId;
+  renderConvList();
+  // 加载会话详情（历史消息）
+  loadConversationDetail(convId);
+}
+
+async function loadConversationDetail(convId) {
+  try {
+    const resp = await api('/api/conversations/' + encodeURIComponent(convId));
+    const data = await resp.json();
+    if (!data.ok || !data.conversation) return;
+
+    const conv = data.conversation;
+    const messagesDiv = document.getElementById('chatMessages');
+    messagesDiv.innerHTML = '';
+
+    // 渲染历史消息
+    if (conv.messages && conv.messages.length > 0) {
+      conv.messages.forEach(m => {
+        if (m.role === 'user') {
+          messagesDiv.innerHTML += '<div class="msg user"><div class="avatar">U</div><div class="bubble">' + escapeHtml(m.content) + '</div></div>';
+        } else if (m.role === 'assistant') {
+          messagesDiv.innerHTML += '<div class="msg ai"><div class="avatar">AI</div><div class="bubble">' + escapeHtml(m.content) + '</div></div>';
+        }
+      });
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    } else {
+      messagesDiv.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);font-size:13px">新会话，发送第一条消息开始对话</div>';
+    }
+  } catch (e) {
+    console.error('loadConversationDetail:', e);
+  }
+}
+
+async function createConversation() {
+  if (!currentAgent) { alert('请先选择一个 Agent'); return; }
+  const agentId = currentAgent.agentId || currentAgent.deviceId;
+  try {
+    const resp = await api('/api/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: agentId }),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+
+    currentConversation = data.conversation_id;
+    await loadConversations();
+    // 清空聊天区域
+    document.getElementById('chatMessages').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);font-size:13px">新会话，发送第一条消息开始对话</div>';
+  } catch (e) {
+    alert('创建会话失败: ' + e.message);
+  }
+}
+
+function toggleConvPanel() {
+  const panel = document.getElementById('convPanel');
+  panel.classList.toggle('open');
+}
+
+// ── Request Log (请求日志) ──
+async function loadRequestLog() {
+  try {
+    const convParam = currentConversation ? '?conversation_id=' + encodeURIComponent(currentConversation) : '';
+    const resp = await api('/api/requests' + convParam);
+    const data = await resp.json();
+    renderRequestLog(data.requests || []);
+  } catch (e) { console.error('loadRequestLog:', e); }
+}
+
+function renderRequestLog(requests) {
+  const body = document.getElementById('logBody');
+  if (requests.length === 0) {
+    body.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);font-size:13px">暂无请求记录</div>';
+    return;
+  }
+
+  body.innerHTML = requests.map(r => {
+    const statusClass = r.status || 'pending';
+    const time = new Date(r.timestamp).toLocaleString('zh-CN');
+    let responsePreview = '';
+    if (r.response) {
+      responsePreview = r.response.length > 200 ? r.response.substring(0, 200) + '...' : r.response;
+    }
+    return '<div class="log-entry">' +
+      '<div><span class="log-method">' + escapeHtml(r.method) + '</span> <span class="log-status ' + statusClass + '">' + statusClass.toUpperCase() + '</span></div>' +
+      (responsePreview ? '<div class="log-response">' + escapeHtml(responsePreview) + '</div>' : '') +
+      '<div class="log-time">' + time + '</div></div>';
+  }).join('');
+}
+
+function toggleLogPanel() {
+  const panel = document.getElementById('logPanel');
+  panel.classList.toggle('open');
+  if (panel.classList.contains('open')) {
+    loadRequestLog();
   }
 }
 
