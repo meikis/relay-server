@@ -1,0 +1,43 @@
+# Fly.io 配置文件
+# 文档: https://fly.io/docs/reference/configuration/
+#
+# 使用方式:
+#   1. 安装 flyctl: https://fly.io/docs/hands-on/install-flyctl/
+#   2. 登录: flyctl auth login
+#   3. 启动: flyctl launch --no-deploy
+#   4. 部署: flyctl deploy
+#
+# Fly.io 免费套餐:
+#   - 3 个 shared-cpu-1x VM (256MB RAM)
+#   - 每月 3GB 出站流量
+#   - 支持 WebSocket ✅
+
+app = "doze-relay"
+primary_region = "nrt"           # 东京区域（离中国最近）
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 4000           # 容器内部端口
+  force_https = true             # 自动 HTTPS
+  auto_stop_machines = true      # 无请求时自动停止（省钱）
+  auto_start_machines = true     # 有请求时自动启动
+  min_machines_running = 0       # 最少运行 0 台机器（完全免费）
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 20
+
+# 环境变量
+[env]
+  PORT = "4000"
+  # DOZE_RELAY_TOKEN = "your-secret-token"
+
+# VM 配置（最小规格）
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

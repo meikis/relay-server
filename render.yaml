@@ -1,0 +1,27 @@
+# Render 配置文件
+# 文档: https://render.com/docs/blueprint-spec
+#
+# 使用方式:
+#   1. 在 https://render.com 创建新项目
+#   2. 选择 "Blueprint" 并指向本文件
+#   3. Render 会自动识别并部署
+
+services:
+  - type: web
+    name: doze-relay
+    runtime: node
+    plan: free                    # 免费套餐（512MB RAM, 750 小时/月）
+    region: singapore             # 选择离你最近的区域
+    buildCommand: npm install
+    startCommand: node relay.js
+    healthCheckPath: /health
+    autoDeploy: true              # git push 后自动部署
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # 可选：设置认证 Token
+      # - key: DOZE_RELAY_TOKEN
+      #   value: your-secret-token
+      # PORT 由 Render 自动注入，无需手动设置
+    # 免费套餐会在 15 分钟无请求后休眠
+    # 首次请求会自动唤醒（可能有几秒延迟）

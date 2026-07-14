@@ -1,0 +1,17 @@
+{
+  "name": "doze-relay",
+  "version": "1.0.0",
+  "description": "Doze Relay — 云中继服务器，解决无公网 IP 的连接问题",
+  "type": "module",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js",
+    "dev": "node relay.js --port 4000"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
