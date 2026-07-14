@@ -204,7 +204,8 @@ const httpServer = createServer(async (req, res) => {
 
   // ── 管理页面 (Web UI) ──
   if (path === '/' || path === '/relay' || path === '/app') {
-    return sendHTML(res, 200, renderWebUI(req.headers.host));
+    const httpProtocol = req.headers['x-forwarded-proto'] === 'https' || req.connection?.encrypted ? 'https' : 'http';
+    return sendHTML(res, 200, renderWebUI(`${httpProtocol}://${req.headers.host}`));
   }
 
   // ── Access Key 验证 ──
@@ -234,8 +235,9 @@ const httpServer = createServer(async (req, res) => {
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 分钟有效
     });
 
-    // 生成配对命令
-    const host = `http://${req.headers.host}`;
+    // 生成配对命令 (自动检测 HTTP/HTTPS)
+    const httpProtocol = req.headers['x-forwarded-proto'] === 'https' || req.connection?.encrypted ? 'https' : 'http';
+    const host = `${httpProtocol}://${req.headers.host}`;
     const command = `npx -y doze-bridge --pat-token=${patToken} --pair-code=${pairCode} --relay-url=${host}`;
 
     return sendJSON(res, 200, {
