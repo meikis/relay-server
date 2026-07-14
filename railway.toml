@@ -6,12 +6,14 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "node relay.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
-# 环境变量（在 Railway Dashboard 中设置，或在此声明默认值）
-# Railway 会自动注入 PORT 环境变量
-
-# 可选：设置认证 Token（防止未授权访问）
-# [env]
-# DOZE_RELAY_TOKEN = "your-secret-token"
+# 环境变量（在 Railway Dashboard → Variables 中设置）
+# Railway 会自动注入 PORT 环境变量，无需手动设置
+#
+# 可选环境变量:
+#   DOZE_RELAY_TOKEN — 认证 Token，防止未授权访问 /api/pair/init
+#     示例: DOZE_RELAY_TOKEN=your-secret-token

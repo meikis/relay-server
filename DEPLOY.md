@@ -5,13 +5,13 @@
 - [什么是 Doze Relay](#什么是-doze-relay)
 - [平台对比](#平台对比)
 - [方案一：Railway 部署（推荐）](#方案一railway-部署推荐)
-- [方案二：Render 部署](#方案二render-部署)
-- [方案三：Fly.io 部署](#方案三flyio-部署)
+- [方案二：Fly.io 部署](#方案二flyio-部署)
+- [方案三：Render 部署](#方案三render-部署)
 - [方案四：Docker 自建部署](#方案四docker-自建部署)
 - [方案五：Vercel（不适用）](#方案五vercel不适用)
+- [环境变量](#环境变量)
 - [部署后验证](#部署后验证)
-- [配置认证 Token（可选）](#配置认证-token可选)
-- [部署后使用流程](#部署后使用流程)
+- [使用流程](#使用流程)
 - [常见问题](#常见问题)
 
 ---
@@ -19,19 +19,16 @@
 ## 什么是 Doze Relay
 
 ```
-  豆包客户端 ──HTTP──→ Doze Relay (公网) ←──WebSocket── OpenMinis doze-server
-                        (本文件)           (出站连接，无需公网IP)
+  客户端平台 ──HTTP──→ Doze Relay (公网) ←──WebSocket──→ doze-bridge daemon
+  (生成配对命令)       (握手 + 消息路由)                 (spawn Agent 子进程)
 ```
 
-Doze Relay 是一个部署在公网的**中继服务器**，解决 OpenMinis 没有公网 IP 的问题：
+Doze Relay 是部署在公网的**中继服务器**，模拟 Coze 云的功能：
 
-1. OpenMinis 上的 doze-server 通过 WebSocket **主动连接** Relay（出站连接，无需公网 IP）
-2. 豆包客户端发 HTTP 请求到 Relay 的公网地址
-3. Relay 通过 WebSocket 把请求转发给 doze-server
-4. doze-server 处理后把响应通过 WebSocket 发回 Relay
-5. Relay 把响应返回给客户端
-
-**核心原理**：WebSocket 反向连接。只要 OpenMinis 能访问互联网，就能建立连接。
+1. **配对握手**：客户端平台调用 `/api/pair/init` 生成配对命令
+2. **Bridge 连接**：用户在本地执行配对命令，doze-bridge 通过 HTTP 握手获取 deviceId，然后建立 WebSocket 长连接
+3. **消息路由**：Relay 在客户端平台和 Bridge daemon 之间转发 ACP 消息（对话、文件操作、技能管理等）
+4. **向后兼容**：保留旧版 `/ws` + `/r/:room` 模式，旧客户端无需修改
 
 ---
 
@@ -40,8 +37,8 @@ Doze Relay 是一个部署在公网的**中继服务器**，解决 OpenMinis 没
 | 平台 | 免费额度 | WebSocket | SSE 流式 | 冷启动 | 部署难度 | 推荐度 |
 |------|---------|-----------|---------|--------|---------|--------|
 | **Railway** | $5/月额度（约 500h） | ✅ | ✅ | 无 | ⭐ 最简单 | ⭐⭐⭐⭐⭐ |
-| **Render** | 750h/月 | ✅ | ✅ | 15 分钟休眠后 30-60s | ⭐⭐ 简单 | ⭐⭐⭐⭐ |
 | **Fly.io** | 3 VM + 3GB 流量 | ✅ | ✅ | 按需启停，几秒 | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐ |
+| **Render** | 750h/月 | ✅ | ✅ | 15 分钟休眠后 30-60s | ⭐⭐ 简单 | ⭐⭐⭐⭐ |
 | **Docker 自建** | 取决于你的服务器 | ✅ | ✅ | 无 | ⭐⭐⭐ 中等 | ⭐⭐⭐ |
 | **Vercel** | 100GB 带宽 | ❌ | ⚠️ 有限 | 每次 0-1s | — | ❌ 不适用 |
 
@@ -117,60 +114,12 @@ cd packages/server/deploy
 
 - 管理面板：`https://doze-relay-production.up.railway.app/`
 - 健康检查：`https://doze-relay-production.up.railway.app/health`
-- WebSocket 地址：`wss://doze-relay-production.up.railway.app/ws`
+- 配对初始化：`POST https://doze-relay-production.up.railway.app/api/pair/init`
+- Frontier WS：`wss://doze-relay-production.up.railway.app/frontier`
 
 ---
 
-## 方案二：Render 部署
-
-Render 提供免费的 Web Service，支持 WebSocket。免费套餐每月 750 小时，但 15 分钟无请求会休眠。
-
-### 步骤
-
-#### 方式 A：通过 Blueprint 部署
-
-1. **推送代码到 GitHub**
-   - 确保仓库中有 `packages/server/deploy/render.yaml`
-
-2. **创建 Blueprint**
-   - 访问 https://dashboard.render.com/blueprints
-   - 选择你的 GitHub 仓库
-   - Render 会自动识别 `render.yaml` 配置
-   - 点击 **Apply**
-
-3. **等待部署完成**
-   - 获得地址：`https://doze-relay.onrender.com`
-
-#### 方式 B：手动创建
-
-1. 访问 https://dashboard.render.com/create
-2. 选择 **Web Service**
-3. 连接 GitHub 仓库
-4. 填写配置：
-   - **Name**: `doze-relay`
-   - **Runtime**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `node relay.js`
-   - **Health Check Path**: `/health`
-5. 选择 **Free** 套餐
-6. 点击 **Create Web Service**
-
-### 注意事项
-
-- ⚠️ 免费套餐 15 分钟无请求会**自动休眠**
-- 首次请求有 **30-60 秒冷启动延迟**
-- WebSocket 连接在休眠时会断开，doze-server 会自动重连
-- 如需不休眠，升级到 Starter 套餐（$7/月）
-
-### 部署后
-
-- 管理面板：`https://doze-relay.onrender.com/`
-- 健康检查：`https://doze-relay.onrender.com/health`
-- WebSocket 地址：`wss://doze-relay.onrender.com/ws`
-
----
-
-## 方案三：Fly.io 部署
+## 方案二：Fly.io 部署
 
 Fly.io 提供全球边缘节点，支持按需启停，免费套餐包含 3 个 VM。
 
@@ -230,11 +179,48 @@ cd packages/server/deploy
 
 在 `fly.toml` 中修改 `primary_region` 即可。
 
-### 部署后
+---
 
-- 管理面板：`https://doze-relay.fly.dev/`
-- 健康检查：`https://doze-relay.fly.dev/health`
-- WebSocket 地址：`wss://doze-relay.fly.dev/ws`
+## 方案三：Render 部署
+
+Render 提供免费的 Web Service，支持 WebSocket。免费套餐每月 750 小时，但 15 分钟无请求会休眠。
+
+### 步骤
+
+#### 方式 A：通过 Blueprint 部署
+
+1. **推送代码到 GitHub**
+   - 确保仓库中有 `packages/server/deploy/render.yaml`
+
+2. **创建 Blueprint**
+   - 访问 https://dashboard.render.com/blueprints
+   - 选择你的 GitHub 仓库
+   - Render 会自动识别 `render.yaml` 配置
+   - 点击 **Apply**
+
+3. **等待部署完成**
+   - 获得地址：`https://doze-relay.onrender.com`
+
+#### 方式 B：手动创建
+
+1. 访问 https://dashboard.render.com/create
+2. 选择 **Web Service**
+3. 连接 GitHub 仓库
+4. 填写配置：
+   - **Name**: `doze-relay`
+   - **Runtime**: `Node`
+   - **Build Command**: `npm install`
+   - **Start Command**: `node relay.js`
+   - **Health Check Path**: `/health`
+5. 选择 **Free** 套餐
+6. 点击 **Create Web Service**
+
+### 注意事项
+
+- ⚠️ 免费套餐 15 分钟无请求会**自动休眠**
+- 首次请求有 **30-60 秒冷启动延迟**
+- WebSocket 连接在休眠时会断开，doze-bridge 会自动重连
+- 如需不休眠，升级到 Starter 套餐（$7/月）
 
 ---
 
@@ -299,6 +285,7 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
@@ -317,17 +304,30 @@ sudo certbot --nginx -d relay.yourdomain.com
 Doze Relay 依赖 **WebSocket 服务器** 和 **长连接 SSE**，而 Vercel 是 Serverless 平台：
 
 - ❌ 不支持 WebSocket 服务器（函数执行完即销毁）
-- ❌ 无法维护 doze-server 的持久 WebSocket 连接
+- ❌ 无法维护 Bridge daemon 的持久 WebSocket 连接
 - ❌ 没有全局内存状态（每次请求可能分配到不同实例）
 - ⚠️ SSE 有 25 秒超时限制
 
 详见 `VERCEL.md`。
 
-### 替代方案
+---
 
-如果你习惯使用 Vercel，可以：
-1. 在 Railway / Fly.io 部署 Relay（5 分钟搞定）
-2. 其他部分继续使用 Vercel
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `4000` | 监听端口（Railway/Render 自动注入） |
+| `HOST` | `0.0.0.0` | 监听地址 |
+| `DOZE_RELAY_TOKEN` | (无) | 可选认证 Token，保护 `/api/pair/init` 端点 |
+
+### 各平台设置方式
+
+| 平台 | 方式 |
+|------|------|
+| **Railway** | Dashboard → Variables |
+| **Fly.io** | `flyctl secrets set DOZE_RELAY_TOKEN=your-secret` |
+| **Render** | Dashboard → Environment |
+| **Docker** | `-e DOZE_RELAY_TOKEN=your-secret` |
 
 ---
 
@@ -340,78 +340,45 @@ Doze Relay 依赖 **WebSocket 服务器** 和 **长连接 SSE**，而 Vercel 是
 curl https://your-relay-url.com/health
 
 # 期望输出:
-# {"status":"ok","relay":true,"rooms":0,"connections":[],"timestamp":...}
+# {"status":"ok","relay":true,"devices":0,"pairCodes":0,"rooms":0,"timestamp":...}
 
 # 2. 打开管理面板
 # 浏览器访问 https://your-relay-url.com/
-# 应看到 Doze Relay 管理页面，显示"暂无 doze-server 连接"
+# 应看到 Doze Relay 管理页面，显示配对流程说明
 
-# 3. 测试 doze-server 连接（本地模拟）
-node packages/server/standalone.js --relay wss://your-relay-url.com --room testroom
+# 3. 生成配对命令
+curl -X POST https://your-relay-url.com/api/pair/init
 
-# 4. 再次检查健康
-curl https://your-relay-url.com/health
 # 期望输出:
-# {"status":"ok","relay":true,"rooms":1,"connections":["testroom"],...}
+# {"ok":true,"pair_code":"xxxx-xxxxxx","pat_token":"sat_xxx","command":"npx -y doze-bridge ..."}
 ```
 
 ---
 
-## 配置认证 Token（可选）
-
-为了防止未授权访问，可以设置认证 Token。
-
-### 在 Relay 端设置
-
-**Railway**：在 Variables 中添加 `DOZE_RELAY_TOKEN=your-secret`
-**Render**：在 Environment 中添加 `DOZE_RELAY_TOKEN=your-secret`
-**Fly.io**：`flyctl secrets set DOZE_RELAY_TOKEN=your-secret`
-**Docker**：`-e DOZE_RELAY_TOKEN=your-secret`
-
-### 在 doze-server 端传递
-
-```bash
-node doze-server.js \
-  --relay wss://your-relay-url.com \
-  --room myroom \
-  --relay-token your-secret \
-  --model-api http://localhost:8080/v1
-```
-
-### 在客户端传递
-
-```bash
-export DOZE_SERVER_TOKEN=your-secret
-node client.js --relay=https://your-relay-url.com/r/myroom
-```
-
----
-
-## 部署后使用流程
+## 使用流程
 
 ### 完整使用流程（3 步）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  第 1 步: 部署 Relay（一次性，已完成）                        │
+│  第 1 步: 部署 Relay（一次性）                                │
 │  → 获得公网地址: https://doze-relay.up.railway.app           │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  第 2 步: OpenMinis 启动 doze-server（每次使用）              │
-│  → 在 OpenMinis 对话中发送:                                   │
-│    "请安装 Doze Server，连接 Relay:                          │
-│     wss://doze-relay.up.railway.app, room: myroom,          │
-│     model-api: http://localhost:8080/v1,                     │
-│     model-key: sk-xxx, model-name: gpt-4o"                  │
+│  第 2 步: 生成配对命令并执行                                   │
+│  → POST /api/pair/init 获取配对命令                           │
+│  → 在本地机器执行: npx -y doze-bridge --pat-token=...        │
+│  → Bridge daemon 自动: 握手 → WS 连接 → Agent 探测 → OS 自启  │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  第 3 步: 豆包客户端连接                                      │
-│  → node client.js --relay=https://doze-relay.up.railway.app/r/myroom │
-│  → 自动检测 → 连接 → 对话                                    │
+│  第 3 步: 客户端平台调用 Agent                                 │
+│  → POST /api/agents/:agentId/prompt (SSE 流式对话)            │
+│  → GET  /api/agents/:agentId/files (文件树)                   │
+│  → GET  /api/agents/:agentId/skills (技能列表)                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -419,58 +386,50 @@ node client.js --relay=https://your-relay-url.com/r/myroom
 
 见上方各平台部署方案。
 
-### 第 2 步：OpenMinis 启动 doze-server
-
-在 OpenMinis 对话中发送：
-
-```
-请安装 Doze Server，使用 Relay 模式：
-- Relay 地址: wss://doze-relay.up.railway.app
-- Room: myroom
-- 模型 API: http://localhost:8080/v1
-- API Key: sk-your-key
-- 模型名: gpt-4o
-```
-
-或者直接在 OpenMinis Shell 中运行：
+### 第 2 步：生成配对命令并执行
 
 ```bash
-# 使用安装脚本
-DOZE_RELAY=wss://doze-relay.up.railway.app \
-DOZE_ROOM=myroom \
-DOZE_MODEL_API=http://localhost:8080/v1 \
-DOZE_MODEL_KEY=sk-your-key \
-DOZE_MODEL_NAME=gpt-4o \
-sh /var/minis/workspace/install-doze.sh
+# 1. 客户端平台调用 Relay API 生成配对命令
+curl -X POST https://doze-relay.up.railway.app/api/pair/init
 
-# 或手动启动
-nohup node /var/minis/workspace/doze-server.js \
-  --relay wss://doze-relay.up.railway.app \
-  --room myroom \
-  --model-api http://localhost:8080/v1 \
-  --model-key sk-your-key \
-  --model-name gpt-4o \
-  > /var/minis/workspace/doze-server.log 2>&1 &
+# 返回:
+# {
+#   "ok": true,
+#   "pair_code": "a1b2-c3d4e5",
+#   "pat_token": "sat_xxx...",
+#   "command": "npx -y doze-bridge --pat-token=sat_xxx --pair-code=a1b2-c3d4e5 --relay-url=https://doze-relay.up.railway.app",
+#   "expires_in": 600
+# }
+
+# 2. 用户在本地机器（有 Claude Code / OpenClaw / Codex 的机器）执行配对命令
+npx -y doze-bridge --pat-token=sat_xxx --pair-code=a1b2-c3d4e5 --relay-url=https://doze-relay.up.railway.app
+
+# 3. Bridge daemon 自动完成:
+#    HTTP 握手 → WebSocket 连接 → Agent 探测 → OS 自启
 ```
 
-### 第 3 步：豆包客户端连接
+### 第 3 步：客户端平台调用 Agent
 
 ```bash
-# 进入客户端目录
-cd examples/doubao-client
+# 列出已连接的 Agent
+curl https://doze-relay.up.railway.app/api/agents
 
-# 安装依赖（首次）
-npm install
+# 发送对话 (SSE 流式)
+curl -N -X POST https://doze-relay.up.railway.app/api/agents/agent_xxx/prompt \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 
-# 连接 Relay
-node src/index.js --relay=https://doze-relay.up.railway.app/r/myroom
+# 创建新 Agent
+curl -X POST https://doze-relay.up.railway.app/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"framework":"claude-code","agent_id":"my-agent"}'
+
+# 获取文件树
+curl https://doze-relay.up.railway.app/api/agents/agent_xxx/files
+
+# 获取技能列表
+curl https://doze-relay.up.railway.app/api/agents/agent_xxx/skills
 ```
-
-客户端会自动：
-1. 检测 Relay 状态
-2. 确认 doze-server 已连接
-3. 创建 Bot
-4. 开始流式对话
 
 ---
 
@@ -482,61 +441,67 @@ node src/index.js --relay=https://doze-relay.up.railway.app/r/myroom
 # 检查健康
 curl https://your-relay-url/health
 
-# 如果返回 502，说明 doze-server 未连接
 # 如果返回超时，说明 Relay 未启动成功
 # 查看 Railway/Render/Fly.io 的日志
 ```
 
-### Q: doze-server 连不上 Relay？
+### Q: Bridge daemon 连不上 Relay？
 
 ```bash
-# 1. 确认 Relay 地址正确（wss:// 不是 ws://）
-# 2. 确认 OpenMinis 可以访问互联网
-# 3. 查看 doze-server 日志
-cat /var/minis/workspace/doze-server.log
+# 1. 确认 Relay 地址正确 (https:// 不是 http://)
+# 2. 确认本地机器可以访问互联网
+# 3. 查看 Bridge daemon 日志
+cat ~/.doze/bridge/bridge.log
 
-# 4. 手动测试连接
-node -e "const ws = new WebSocket('wss://your-relay-url/ws?room=test'); ws.onopen = () => { console.log('connected!'); ws.close(); }; ws.onerror = (e) => console.error('error:', e.message);"
+# 4. 确认配对码未过期 (10 分钟有效期)
+curl -X POST https://your-relay-url/api/pair/init
+# 重新获取配对命令并执行
 ```
 
 ### Q: Render 免费套餐休眠怎么办？
 
-- 休眠后 doze-server 会自动重连（3 秒重试）
+- 休眠后 Bridge daemon 会自动重连（指数退避重试）
 - 客户端首次请求有 30-60 秒冷启动延迟
 - 如需不休眠，升级到 Starter 套餐（$7/月）
 - 或使用 UptimeRobot 等服务定时 ping `/health` 保持活跃
 
-### Q: 多个 OpenMinis 设备能同时连接吗？
+### Q: 多个设备能同时连接吗？
 
-可以！每个设备使用不同的 `--room` 名称：
+可以！每个设备执行不同的配对命令（不同的 `pair_code`），Relay 会为每个设备分配独立的 `deviceId`。
 
 ```bash
 # 设备 A
-node doze-server.js --relay wss://relay.app --room device-a --model-api ...
+npx -y doze-bridge --pat-token=sat_aaa --pair-code=code-a --relay-url=https://relay.app
 
 # 设备 B
-node doze-server.js --relay wss://relay.app --room device-b --model-api ...
-```
-
-客户端分别连接：
-```bash
-node client.js --relay=https://relay.app/r/device-a
-node client.js --relay=https://relay.app/r/device-b
+npx -y doze-bridge --pat-token=sat_bbb --pair-code=code-b --relay-url=https://relay.app
 ```
 
 ### Q: 安全性如何保证？
 
-1. **设置认证 Token**（见上方配置）
+1. **设置认证 Token**（`DOZE_RELAY_TOKEN` 环境变量）
 2. **使用 HTTPS/WSS**（Railway/Render/Fly.io 自动提供）
-3. **使用复杂的 room 名称**（避免被猜到）
-4. **Relay 不存储数据**（只转发请求，重启后无残留）
+3. **配对码一次性使用**，10 分钟过期
+4. **Relay 不存储数据**（只转发消息，重启后无残留）
 
 ### Q: SSE 流式对话延迟如何？
 
 ```
-客户端 → Relay:    ~10-50ms（取决于到云平台的延迟）
-Relay → doze-server: ~10-50ms（WebSocket 已建立，无额外延迟）
-doze-server → 模型API: 取决于模型 API 延迟
+客户端 → Relay:       ~10-50ms（取决于到云平台的延迟）
+Relay → Bridge:       ~10-50ms（WebSocket 已建立，无额外延迟）
+Bridge → Agent:       取决于 Agent 处理时间
 ```
 
 总延迟与直连相比增加约 20-100ms，对流式对话体验影响很小。
+
+### Q: 旧版 doze-server 还能用吗？
+
+可以！Relay 保留了 `/ws` + `/r/:room` 旧版兼容模式：
+
+```bash
+# 旧版 doze-server 连接 (向后兼容)
+node standalone.js --relay wss://doze-relay.up.railway.app --room myroom
+
+# 旧版客户端连接
+node client.js --relay=https://doze-relay.up.railway.app/r/myroom
+```

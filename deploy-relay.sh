@@ -76,14 +76,25 @@ deploy_railway() {
 
   inf "部署中... 请在 Railway Dashboard 查看进度"
   echo ""
-  echo "  部署完成后你会获得一个公网地址，如:"
-  echo "  https://doze-relay-production.up.railway.app"
+  echo "  ════════════════════════════════════════════"
+  echo "  部署完成后:"
   echo ""
-  echo "  然后启动 doze-server:"
-  echo "  node doze-server.js --relay wss://doze-relay-production.up.railway.app --room myroom"
+  echo "  1. 在 Railway Dashboard → Settings → Networking"
+  echo "     点击 Generate Domain 获取公网地址"
+  echo "     如: https://doze-relay-production.up.railway.app"
   echo ""
-  echo "  客户端连接:"
-  echo "  node client.js --relay=https://doze-relay-production.up.railway.app/r/myroom"
+  echo "  2. 生成配对命令:"
+  echo "     curl -X POST https://doze-relay-production.up.railway.app/api/pair/init"
+  echo ""
+  echo "  3. 在本地机器执行配对命令:"
+  echo "     npx -y doze-bridge --pat-token=sat_xxx --pair-code=xxxx \\"
+  echo "       --relay-url=https://doze-relay-production.up.railway.app"
+  echo ""
+  echo "  4. 客户端调用 Agent:"
+  echo "     curl -N -X POST https://doze-relay-production.up.railway.app/api/agents/agent_xxx/prompt \\"
+  echo "       -H 'Content-Type: application/json' \\"
+  echo "       -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'"
+  echo "  ════════════════════════════════════════════"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -111,12 +122,6 @@ deploy_render() {
   echo ""
   echo "  部署完成后获得地址如:"
   echo "  https://doze-relay.onrender.com"
-  echo ""
-  echo "  然后启动 doze-server:"
-  echo "  node doze-server.js --relay wss://doze-relay.onrender.com --room myroom"
-  echo ""
-  echo "  客户端连接:"
-  echo "  node client.js --relay=https://doze-relay.onrender.com/r/myroom"
   echo ""
   echo "  ⚠ Render 免费套餐 15 分钟无请求会休眠"
   echo "    首次请求有 30-60 秒冷启动延迟"
@@ -162,11 +167,8 @@ deploy_fly() {
   echo "  部署完成后获得地址如:"
   echo "  https://doze-relay.fly.dev"
   echo ""
-  echo "  然后启动 doze-server:"
-  echo "  node doze-server.js --relay wss://doze-relay.fly.dev --room myroom"
-  echo ""
-  echo "  客户端连接:"
-  echo "  node client.js --relay=https://doze-relay.fly.dev/r/myroom"
+  echo "  生成配对命令:"
+  echo "  curl -X POST https://doze-relay.fly.dev/api/pair/init"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -194,6 +196,9 @@ deploy_docker() {
   docker run -d --name doze-relay -p 4000:4000 --restart unless-stopped doze-relay
 
   ok "Relay 已启动: http://localhost:4000"
+  echo ""
+  echo "  生成配对命令:"
+  echo "  curl -X POST http://localhost:4000/api/pair/init"
   echo ""
   echo "  查看日志:   docker logs doze-relay"
   echo "  停止:       docker stop doze-relay"
@@ -226,7 +231,8 @@ deploy_local() {
 
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════════╗"
-echo "║  Doze Relay 部署工具                      ║"
+echo "║  Doze Relay v2 部署工具                   ║"
+echo "║  模拟 Coze 云握手 + Frontier WebSocket    ║"
 echo "╚══════════════════════════════════════════╝"
 echo -e "${RESET}"
 

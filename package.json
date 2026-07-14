@@ -1,7 +1,7 @@
 {
   "name": "doze-relay",
-  "version": "1.0.0",
-  "description": "Doze Relay — 云中继服务器，解决无公网 IP 的连接问题",
+  "version": "2.0.0",
+  "description": "Doze Relay — 云中继服务器，模拟 Coze 云握手 + Frontier WebSocket 协议",
   "type": "module",
   "main": "relay.js",
   "scripts": {
