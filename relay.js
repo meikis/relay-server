@@ -503,6 +503,11 @@ const httpServer = createServer(async (req, res) => {
     // 发送初始事件（包含会话 ID）
     res.write(`data: ${JSON.stringify({ event: 'conversation.chat.created', chat_id: messageId, conversation_id: convId, status: 'in_progress' })}\n\n`);
 
+    // 发送「思考中」事件 — 让 Web UI 立即显示 Agent 正在处理
+    const thinkingTexts = ['🤔 思考中...', '✨ 分析问题中', '💡 构思回复中', '⚡ 处理中...', '🔍 搜索知识库', '📝 整理思路中', '🚀 准备回答'];
+    const randomThinking = thinkingTexts[Math.floor(Math.random() * thinkingTexts.length)];
+    res.write(`data: ${JSON.stringify({ event: 'conversation.thinking', chat_id: messageId, text: randomThinking })}\n\n`);
+
     let fullResponse = '';
     try {
       await sendToDeviceStream(deviceId, acpRequest, (event) => {
@@ -597,7 +602,8 @@ const httpServer = createServer(async (req, res) => {
       });
       return sendJSON(res, 200, result);
     } catch (err) {
-      return sendJSON(res, 500, { ok: false, error: err.message });
+      // Bridge 不支持文件树时返回空列表而非 500
+      return sendJSON(res, 200, { ok: true, files: [], note: 'Bridge does not support file tree' });
     }
   }
 
@@ -617,7 +623,8 @@ const httpServer = createServer(async (req, res) => {
       });
       return sendJSON(res, 200, result);
     } catch (err) {
-      return sendJSON(res, 500, { ok: false, error: err.message });
+      // Bridge 不支持技能时返回空列表而非 500
+      return sendJSON(res, 200, { ok: true, skills: [], note: 'Bridge does not support skills' });
     }
   }
 
@@ -696,42 +703,57 @@ frontierWss.on('connection', (ws, req) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // ACP 响应 (有 id)
-    if (msg.id) {
-      const pending = deviceInfo.pendingRequests?.get(msg.id);
-      if (!pending) return;
+    // ── 辅助: 通过 id 或 params.requestId 查找 pending request ──
+    function findPending(msg) {
+      // 优先通过 msg.id 查找（标准 ACP 响应）
+      if (msg.id) {
+        const p = deviceInfo.pendingRequests?.get(msg.id);
+        if (p) return p;
+      }
+      // 其次通过 params.requestId 查找（流式通知，Bridge 端 notify 发送）
+      if (msg.params?.requestId) {
+        const p = deviceInfo.pendingRequests?.get(msg.params.requestId);
+        if (p) return p;
+      }
+      return null;
+    }
 
-      // 流式事件
+    // ACP 响应 (有 id) 或 流式通知 (有 params.requestId)
+    const pending = findPending(msg);
+
+    if (pending) {
+      // 最终响应 (有 result 或 error)
+      if (msg.result !== undefined) {
+        const reqId = msg.id || msg.params?.requestId;
+        deviceInfo.pendingRequests.delete(reqId);
+        pending.resolve(msg.result);
+        return;
+      }
+      if (msg.error) {
+        const reqId = msg.id || msg.params?.requestId;
+        deviceInfo.pendingRequests.delete(reqId);
+        pending.reject(new Error(msg.error.message || 'ACP error'));
+        return;
+      }
+
+      // 流式事件 (有 method + params)
       if (msg.method && msg.params) {
         if (pending.isStream && pending.onEvent) {
           pending.onEvent(msg);
         }
         return; // 流式事件不结束请求
       }
-
-      // 最终响应
-      if (msg.result !== undefined) {
-        deviceInfo.pendingRequests.delete(msg.id);
-        pending.resolve(msg.result);
-      } else if (msg.error) {
-        deviceInfo.pendingRequests.delete(msg.id);
-        pending.reject(new Error(msg.error.message || 'ACP error'));
-      }
-      return;
     }
 
-    // ACP 通知 (无 id) — Bridge 主动发送的事件
-    if (msg.method && !msg.id) {
-      // 例如 _agent/health 心跳
+    // ACP 通知 (无 id，无 requestId) — Bridge 主动发送的事件
+    if (msg.method && !msg.id && !msg.params?.requestId) {
+      // _agent/health 心跳
       if (msg.method === '_agent/health') {
-        // 更新设备信息
         if (msg.params?.agents) {
           deviceInfo.agentHealth = msg.params.agents;
         }
         return;
       }
-
-      // 其他通知可以转发给感兴趣的客户端
       console.log(`[Frontier] Notification from ${deviceId}: ${msg.method}`);
     }
   });
@@ -877,6 +899,16 @@ input,textarea{font-family:inherit;outline:none}
 .msg.ai .bubble{background:var(--surface);border:1px solid var(--border);border-top-left-radius:4px}
 .msg.ai .bubble .cursor{display:inline-block;width:2px;height:16px;background:var(--accent);animation:blink 1s infinite;vertical-align:text-bottom}
 @keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}
+
+/* ── Thinking Bubble (思考中动画) ── */
+.thinking-bubble{display:flex;align-items:center;gap:8px;color:var(--text2);font-size:13px;padding:4px 0}
+.thinking-text{font-weight:500}
+.thinking-dots{display:flex;gap:3px}
+.thinking-dots span{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:thinking-bounce 1.4s infinite both}
+.thinking-dots span:nth-child(1){animation-delay:-0.32s}
+.thinking-dots span:nth-child(2){animation-delay:-0.16s}
+.thinking-dots span:nth-child(3){animation-delay:0s}
+@keyframes thinking-bounce{0%,80%,100%{transform:scale(0.6);opacity:.4}40%{transform:scale(1);opacity:1}}
 .chat-input{padding:16px 20px;border-top:1px solid var(--border);background:var(--bg2)}
 .chat-input form{display:flex;gap:12px;align-items:flex-end}
 .chat-input textarea{flex:1;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;resize:none;max-height:120px;line-height:1.5}
@@ -1191,11 +1223,30 @@ async function sendMessage(e) {
 
   // User message
   messagesDiv.innerHTML += '<div class="msg user"><div class="avatar">U</div><div class="bubble">' + escapeHtml(msg) + '</div></div>';
-  // AI placeholder
-  messagesDiv.innerHTML += '<div class="msg ai" id="aiPlaceholder"><div class="avatar">AI</div><div class="bubble"><span class="cursor"></span></div></div>';
+  // AI placeholder — 显示「思考中」状态
+  messagesDiv.innerHTML += '<div class="msg ai" id="aiPlaceholder"><div class="avatar">AI</div><div class="bubble thinking-bubble"><span class="thinking-text"></span><span class="thinking-dots"><span></span><span></span><span></span></span></div></div>';
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
   document.getElementById('sendBtn').disabled = true;
+
+  // 思考中文案池（带 Emoji）
+  const thinkingTexts = ['🤔 思考中', '✨ 分析问题中', '💡 构思回复中', '⚡ 处理中', '🔍 搜索知识库', '📝 整理思路中', '🚀 准备回答', '🎯 聚焦问题中', '💬 组织语言中', '🧠 深度思考中'];
+  let thinkingIndex = 0;
+  let thinkingTimer = null;
+
+  // 启动思考动画：每 1.5s 切换文案
+  function startThinkingAnimation() {
+    const el = document.querySelector('#aiPlaceholder .thinking-text');
+    if (!el) return;
+    el.textContent = thinkingTexts[0];
+    thinkingTimer = setInterval(() => {
+      thinkingIndex = (thinkingIndex + 1) % thinkingTexts.length;
+      if (el && el.classList.contains('thinking-text')) {
+        el.textContent = thinkingTexts[thinkingIndex];
+      }
+    }, 1500);
+  }
+  startThinkingAnimation();
 
   try {
     // 构造请求体，包含当前会话 ID（如果有）
@@ -1239,9 +1290,18 @@ async function sendMessage(e) {
                 loadConversations();  // 刷新会话列表
               }
             }
+            // 收到思考中事件 — 更新文案（可选，动画已在运行）
+            if (event.event === 'conversation.thinking') {
+              // 思考动画已经在运行，这里可以忽略或更新为服务端指定的文案
+              const thinkingEl = document.querySelector('#aiPlaceholder .thinking-text');
+              if (thinkingEl && event.text) thinkingEl.textContent = event.text;
+            }
             if (event.event === 'conversation.message.delta' && event.delta) {
+              // 停止思考动画，切换到打字模式
+              if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
               aiText += event.delta;
               placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) + '<span class="cursor"></span>';
+              placeholder.querySelector('.bubble').classList.remove('thinking-bubble');
               messagesDiv.scrollTop = messagesDiv.scrollHeight;
             } else if (event.event === 'conversation.chat.completed') {
               placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText);
@@ -1255,7 +1315,10 @@ async function sendMessage(e) {
       }
     }
     // Final cleanup
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
     if (placeholder) {
+      const bubble = placeholder.querySelector('.bubble');
+      if (bubble) bubble.classList.remove('thinking-bubble');
       placeholder.querySelector('.bubble').innerHTML = escapeHtml(aiText) || '(empty response)';
       placeholder.removeAttribute('id');
     }
@@ -1263,8 +1326,13 @@ async function sendMessage(e) {
     // 刷新请求日志
     loadRequestLog();
   } catch (err) {
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
     const placeholder = document.getElementById('aiPlaceholder');
-    if (placeholder) placeholder.querySelector('.bubble').innerHTML = '<span style="color:var(--red)">Failed: ' + escapeHtml(err.message) + '</span>';
+    if (placeholder) {
+      const bubble = placeholder.querySelector('.bubble');
+      if (bubble) bubble.classList.remove('thinking-bubble');
+      placeholder.querySelector('.bubble').innerHTML = '<span style="color:var(--red)">Failed: ' + escapeHtml(err.message) + '</span>';
+    }
   } finally {
     document.getElementById('sendBtn').disabled = false;
     document.getElementById('msgInput').focus();
