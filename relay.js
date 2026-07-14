@@ -509,7 +509,11 @@ const httpServer = createServer(async (req, res) => {
 
 // ── WebSocket 服务器: Frontier (Bridge daemon 长连接) ────────
 
-const frontierWss = new WebSocketServer({ server: httpServer, path: '/frontier' });
+const frontierWss = new WebSocketServer({ 
+  server: httpServer, 
+  path: '/frontier',
+  perMessageDeflate: false,  // 显式禁用压缩，避免 RSV1 位错误
+});
 
 frontierWss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
